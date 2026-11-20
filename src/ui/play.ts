@@ -17,6 +17,7 @@ import {
   hasKw,
   isLeader,
   ownerOf,
+  playCost,
   powerBreakdown,
   powerOf,
   whoActs,
@@ -607,8 +608,10 @@ function bar(ch: Choice | null, free: boolean): HTMLElement {
     const fc = findField(g, s.sel);
     if (me.hand.includes(s.sel)) {
       const why = whyCantPlay(g, s.sel);
-      line = why ? h('span', null, h('b', null, d.name), ` — cannot be played now: ${why}`) : h('span', null, h('b', null, d.name), ` — costs ${d.cost} DON!! (you have ${me.donActive} active).`);
-      acts.push(btn(`Play (${d.cost} DON!!)`, () => act({ type: 'play', uid: s.sel! }), { cls: 'primary', disabled: !!why, title: why ?? '' }));
+      const cost = playCost(g, ME, s.sel);
+      const was = cost !== d.cost ? `, ${cost < d.cost ? 'reduced' : 'raised'} from ${d.cost} by an effect` : '';
+      line = why ? h('span', null, h('b', null, d.name), ` — cannot be played now: ${why}`) : h('span', null, h('b', null, d.name), ` — costs ${cost} DON!!${was} (you have ${me.donActive} active).`);
+      acts.push(btn(`Play (${cost} DON!!)`, () => act({ type: 'play', uid: s.sel! }), { cls: 'primary', disabled: !!why, title: why ?? '' }));
     } else if (fc && ownerOf(s.sel) === ME) {
       const isStage = me.stage?.uid === s.sel;
       const whyA = isStage ? 'Stages cannot attack.' : whyCantAttack(g, s.sel);
@@ -751,7 +754,7 @@ function promptFor(ch: Choice): HTMLElement {
           opts.map((u) => {
             const d = defOf(g, u);
             const boost = d.category === 'Character' ? d.counter : (d.effects?.find((e) => e.timing === 'counter')?.boost ?? 0);
-            return h('div', { class: 'pick' }, cardEl(d, { size: 'sm', cls: 'option', tag: `+${boost}`, onClick: () => answer({ kind: 'counter', use: u }) }), h('small', null, d.category === 'Event' ? `Event · ${d.cost} DON!!` : 'Trash for counter'));
+            return h('div', { class: 'pick' }, cardEl(d, { size: 'sm', cls: 'option', tag: `+${boost}`, onClick: () => answer({ kind: 'counter', use: u }) }), h('small', null, d.category === 'Event' ? `Event · ${playCost(g, ME, u)} DON!!` : 'Trash for counter'));
           }),
         ),
         h('div', { class: 'row' }, btn(info && info.need > 0 ? 'No counter — take it' : 'Done', () => answer({ kind: 'counter', use: null }), { cls: 'primary' }), tail),

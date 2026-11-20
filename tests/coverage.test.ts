@@ -18,6 +18,8 @@ describe('card database', () => {
     }
     console.log(Object.entries(miss).sort((a, b) => b[1] - a[1]).slice(0, 45).map((e) => `${e[1]}  ${e[0]}`).join('\n'));
     expect(ALL_CARDS.length).toBeGreaterThan(2500);
+    // At least 9 cards in 10 are playable in matches.
+    expect(by.none ?? 0).toBeLessThan(ALL_CARDS.length * 0.1);
   });
 
   it('ST-30 is a legal, fully simulated 50-card deck', () => {

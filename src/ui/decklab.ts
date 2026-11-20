@@ -218,7 +218,7 @@ export function render(root: HTMLElement): void {
   const test = (): void => {
     const problems = validateDeck(cur);
     if (problems.length) {
-      modal(h('div', null, h('h2', null, 'This list cannot be test-played yet'), h('ul', null, problems.map((p) => h('li', { class: p.level === 'error' ? 'bad' : '' }, p.msg))), h('p', { class: 'muted' }, 'Fix the errors, and swap out reference-only cards, then try again.')));
+      modal(h('div', null, h('h2', null, 'This list cannot be test-played yet'), h('ul', null, problems.map((p) => h('li', { class: p.level === 'error' ? 'bad' : '' }, p.msg))), h('p', { class: 'muted' }, 'Fix the errors, and swap out the cards marked "REF" (not playable yet), then try again.')));
       return;
     }
     saveDeck(cur);

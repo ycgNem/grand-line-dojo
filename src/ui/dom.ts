@@ -3,6 +3,7 @@
 import { kw } from '../data/analysis';
 import type { CardDef, Color } from '../engine/types';
 import { crestOf, hash, icon } from './art';
+import { localPicture } from './localart';
 
 export type Child = Node | string | number | null | undefined | false | Child[];
 type Attrs = Record<string, unknown>;
@@ -140,8 +141,11 @@ function clickable(onClick: ((e: MouseEvent) => void) | undefined, label: string
 /**
  * The picture on a card: an original scene for its colour (two colours split the frame diagonally),
  * nudged sideways, mirrored and tinted by the card number so neighbours do not look identical.
+ * A picture of your own in the local-art/ folder replaces the drawn scene (on this computer only).
  */
 function cardArt(d: CardDef): HTMLElement {
+  const pic = localPicture(d.id);
+  if (pic) return h('div', { class: 'cart photo', style: { backgroundImage: `url(${JSON.stringify(pic)})` } });
   const n = hash(d.id);
   const scene = (c: Color | undefined): string => `s-${(c ?? 'Black').toLowerCase()}`;
   return h(

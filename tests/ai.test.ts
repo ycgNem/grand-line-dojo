@@ -62,6 +62,7 @@ describe('CPU player', () => {
   });
 
   it('can pilot random decks of auto-compiled cards', () => {
-    for (let s = 0; s < 60; s++) expect(playOut(randomDeck(500 + s), randomDeck(700 + s), 40 + s, ['hard', 'normal']).winner).not.toBeNull();
+    const N = Number((globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.AI_N ?? 60);
+    for (let s = 0; s < N; s++) expect(playOut(randomDeck(500 + s), randomDeck(700 + s), 40 + s, ['hard', 'normal']).winner).not.toBeNull();
   });
 });

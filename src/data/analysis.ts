@@ -125,7 +125,7 @@ export function deckAdvice(d: DeckList): Advice[] {
   if (s.avgCost > 3.6) out.push({ level: 'warn', msg: `Average cost ${s.avgCost.toFixed(2)} is high. Expect slow starts; consider more 1–3 cost cards.` });
   else if (s.avgCost < 2.2) out.push({ level: 'info', msg: `Average cost ${s.avgCost.toFixed(2)} is very low. You will empty your hand fast — make sure the deck can draw cards.` });
   else out.push({ level: 'good', msg: `Average cost ${s.avgCost.toFixed(2)} — a balanced curve.` });
-  if (s.unsimulated) out.push({ level: 'info', msg: `${s.unsimulated} cards have effects the simulator cannot run, so this list cannot be test-played here (it may still be a perfectly legal deck).` });
+  if (s.unsimulated) out.push({ level: 'info', msg: `${s.unsimulated} cards use a mechanic the simulator does not model yet, so this list cannot be test-played here (it may still be a perfectly legal deck).` });
   return out;
 }
 
@@ -209,12 +209,12 @@ export const SIM_LABEL: Record<CardDef['sim'], string> = {
   scripted: 'Fully simulated (hand-checked)',
   auto: 'Simulated (auto-read from card text)',
   vanilla: 'Simulated (no effect text)',
-  none: 'Reference only',
+  none: 'Not playable yet',
 };
 
 export const SIM_NOTE: Record<CardDef['sim'], string> = {
   scripted: 'This card’s behaviour was written and tested by hand against its printed text.',
   auto: 'The simulator read this card’s text automatically and understood every sentence. It should play correctly, but unusual interactions were not hand-checked.',
   vanilla: 'No effect text, so it plays exactly as printed.',
-  none: 'You can read and study this card here and use it in Deck Lab lists, but its effect is too complex for the simulator to run, so it cannot be used in matches.',
+  none: 'You can read and study this card here and use it in Deck Lab lists. It uses a one-off mechanic the simulator does not model yet, so it cannot be used in matches for now.',
 };

@@ -3,3 +3,7 @@ dist/
 *.log
 .DS_Store
 .claude/
+
+# Your own card pictures: used on this computer only, never committed or deployed.
+local-art/*
+!local-art/README.md

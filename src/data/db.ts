@@ -39,6 +39,11 @@ function build(r: RawCard): CardDef {
     powerAura: compiled.powerAura,
     dynKeyword: compiled.dynKeyword,
     costAura: compiled.costAura,
+    flagAura: compiled.flagAura,
+    handCost: compiled.handCost,
+    handAura: compiled.handAura,
+    auraFoe: compiled.auraFoe,
+    replaces: compiled.replaces,
     cantBeKoByEffect: compiled.cantBeKoByEffect,
     cantAttack: compiled.cantAttack,
     anyCopies: compiled.anyCopies,
@@ -174,9 +179,9 @@ export function validateDeck(d: DeckList): DeckProblem[] {
     if (c.category === 'Leader') out.push({ level: 'error', msg: `${c.name} is a Leader and cannot go in the deck.` });
     if (k > 4 && !c.anyCopies) out.push({ level: 'error', msg: `Maximum 4 copies of one card number — ${c.name} (${id}) has ${k}.` });
     if (!c.colors.some((col) => leader.colors.includes(col))) out.push({ level: 'error', msg: `${c.name} is ${c.colors.join('/')} — it does not share a colour with your ${leader.colors.join('/')} Leader.` });
-    if (c.sim === 'none') out.push({ level: 'warn', msg: `${c.name} (${id}) has an effect the simulator cannot run yet, so this deck cannot be test-played.` });
+    if (c.sim === 'none') out.push({ level: 'warn', msg: `${c.name} (${id}) uses a mechanic the simulator does not model yet, so this deck cannot be test-played.` });
   }
-  if (leader.sim === 'none') out.push({ level: 'warn', msg: `The Leader ${leader.name} has an effect the simulator cannot run yet, so this deck cannot be test-played.` });
+  if (leader.sim === 'none') out.push({ level: 'warn', msg: `The Leader ${leader.name} uses a mechanic the simulator does not model yet, so this deck cannot be test-played.` });
   return out;
 }
 

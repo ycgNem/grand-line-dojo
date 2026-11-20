@@ -1,13 +1,23 @@
 // Turns printed card text into runnable effects.
 //
-// One Piece card text is highly templated, so a sentence-by-sentence pattern compiler can play a
-// large share of the card pool faithfully. The rule is strict: if ANY sentence on a card is not
-// understood, the whole card is marked unsupported (sim: 'none') rather than played half-right.
+// Card text is built from a small vocabulary (see grammar.ts) and a set of effect sentences (see
+// actions.ts). This file reads a card line by line: the [Timing] tags and costs in front, then the
+// body, which is one of
+//   - a triggered or activated effect            "[On Play] Draw 2 cards."
+//   - a reaction to something that happens       "When your opponent activates an Event, ..."
+//   - a replacement                              "If this Character would be K.O.'d, you may ... instead."
+//   - a continuous effect                        "[DON!! x1] This Character gains +1000 power."
+// The rule is strict: if ANY line on a card is not understood, the whole card is marked
+// unsupported (sim: 'none') rather than played half-right.
 
-import * as fx from './fx';
-import { P, costOf, findField, leaveField, log, opp, ownerOf, powerOf } from './game';
+import { normalise, parseBody, parseClause, splitSentences, trace } from './actions';
+import { P, isLeader, mkCtx, ownerOf } from './game';
+import { KW, KW_RE, inSel, parseCond, parseCount, parseDesc, parseSels, type Sel, type Test } from './grammar';
 import { D } from './registry';
-import type { CardDef, CostSpec, Ctx, EffectDef, FieldCard, Game, Keyword, Step, Timing, Until } from './types';
+import type { CardDef, CostSpec, Ctx, EffectDef, EventType, FieldCard, Flag, Game, GameEvent, Keyword, RemovalCause, ReplaceDef, Timing } from './types';
+
+export { isNamed } from './grammar';
+export { trace };
 
 export interface RawCard {
   id: string;
@@ -32,24 +42,21 @@ export interface Compiled {
   powerAura?: CardDef['powerAura'];
   dynKeyword?: CardDef['dynKeyword'];
   costAura?: CardDef['costAura'];
+  flagAura?: CardDef['flagAura'];
+  handCost?: CardDef['handCost'];
+  handAura?: CardDef['handAura'];
+  auraFoe?: boolean;
+  replaces?: ReplaceDef[];
   cantBeKoByEffect?: boolean;
   cantAttack?: boolean;
   anyCopies?: boolean;
 }
 
-type Test = (g: Game, c: Ctx) => boolean;
-interface Parsed {
-  steps: Step[];
-  tags: string[];
-  boost?: number;
-  ref?: Timing;
-}
-
-const KEYWORDS: Keyword[] = ['Rush', 'Blocker', 'Double Attack', 'Banish', 'Unblockable', 'Rush: Character'];
 const TIMINGS: Record<string, Timing> = {
   'On Play': 'onPlay',
   'When Attacking': 'whenAttacking',
   'On K.O.': 'onKO',
+  'On KO': 'onKO',
   'On Block': 'onBlock',
   'Activate: Main': 'activateMain',
   Main: 'main',
@@ -59,259 +66,7 @@ const TIMINGS: Record<string, Timing> = {
   "On Your Opponent's Attack": 'onOppAttack',
 };
 
-export const isNamed = (d: CardDef, name: string): boolean => d.name === name || !!d.aliases?.includes(name);
-const hasType = (d: CardDef, t: string): boolean => d.types.includes(t);
-const plural = (n: number, s: string): string => `${n} ${s}${n === 1 ? '' : 's'}`;
-
-// ---------------------------------------------------------------- filters
-
-/** "{Straw Hat Crew} type Character card with a cost of 4 or less other than [Nami]" */
-export function parseCardFilter(input: string): ((d: CardDef) => boolean) | null {
-  let s = ` ${input.trim()} `;
-  const tests: ((d: CardDef) => boolean)[] = [];
-  const eat = (re: RegExp, fn: (m: RegExpExecArray) => void): void => {
-    const m = re.exec(s);
-    if (!m) return;
-    fn(m);
-    s = s.replace(m[0], ' ');
-  };
-  eat(/ other than \[([^\]]+)\]/i, (m) => tests.push((d) => !isNamed(d, m[1])));
-  eat(/ with a cost of (\d+) or less/i, (m) => tests.push((d) => d.cost <= +m[1]));
-  eat(/ with a cost of (\d+) or more/i, (m) => tests.push((d) => d.cost >= +m[1]));
-  eat(/ with a cost of (\d+)/i, (m) => tests.push((d) => d.cost === +m[1]));
-  eat(/ with (\d+) power or less/i, (m) => tests.push((d) => d.category === 'Character' && d.power <= +m[1]));
-  eat(/ with (\d+) power or more/i, (m) => tests.push((d) => d.category === 'Character' && d.power >= +m[1]));
-  eat(/ with (\d+) power/i, (m) => tests.push((d) => d.category === 'Character' && d.power === +m[1]));
-  eat(/ \{([^}]+)\} or \{([^}]+)\} type/i, (m) => tests.push((d) => hasType(d, m[1]) || hasType(d, m[2])));
-  eat(/ \{([^}]+)\} type/i, (m) => tests.push((d) => hasType(d, m[1])));
-  eat(/ \[([^\]]+)\] or \[([^\]]+)\]/i, (m) => tests.push((d) => isNamed(d, m[1]) || isNamed(d, m[2])));
-  eat(/ \[([^\]]+)\]/i, (m) => tests.push((d) => isNamed(d, m[1])));
-  eat(/ (red|green|blue|purple|black|yellow) /i, (m) => tests.push((d) => d.colors.some((c) => c.toLowerCase() === m[1].toLowerCase())));
-  eat(/ Character cards? /i, () => tests.push((d) => d.category === 'Character'));
-  eat(/ Events?( cards?)? /i, () => tests.push((d) => d.category === 'Event'));
-  eat(/ Stage cards? /i, () => tests.push((d) => d.category === 'Stage'));
-  eat(/ cards? /i, () => undefined);
-  if (s.trim()) return null;
-  return (d) => tests.every((t) => t(d));
-}
-
-/** " with a cost of 5 or less" → a test for cards on the field. Returns null when not understood. */
-function parseFieldFilter(input: string): fx.FieldFilter | null {
-  const s = input.trim();
-  if (!s) return () => true;
-  let m: RegExpExecArray | null;
-  if ((m = /^with a (base )?cost of (\d+) or less$/i.exec(s))) {
-    const [base, n] = [!!m[1], +m[2]];
-    return (g, t) => (base ? D(t.id).cost : costOf(g, t)) <= n;
-  }
-  if ((m = /^with a (base )?cost of (\d+) or more$/i.exec(s))) {
-    const [base, n] = [!!m[1], +m[2]];
-    return (g, t) => (base ? D(t.id).cost : costOf(g, t)) >= n;
-  }
-  if ((m = /^with a (base )?cost of (\d+)$/i.exec(s))) {
-    const [base, n] = [!!m[1], +m[2]];
-    return (g, t) => (base ? D(t.id).cost : costOf(g, t)) === n;
-  }
-  if ((m = /^with (\d+) (base )?power or less$/i.exec(s))) {
-    const [n, base] = [+m[1], !!m[2]];
-    return (g, t) => (base ? D(t.id).power : powerOf(g, t)) <= n;
-  }
-  if ((m = /^with (\d+) (base )?power or more$/i.exec(s))) {
-    const [n, base] = [+m[1], !!m[2]];
-    return (g, t) => (base ? D(t.id).power : powerOf(g, t)) >= n;
-  }
-  return null;
-}
-
-function parseCond(input: string): Test | null {
-  const s = input.trim();
-  let m: RegExpExecArray | null;
-  const leader = (g: Game, c: Ctx): CardDef => D(P(g, c.player).leader.id);
-  if ((m = /^your Leader has the \{([^}]+)\} type$/i.exec(s))) return (g, c) => hasType(leader(g, c), m![1]);
-  if ((m = /^your Leader's type includes "([^"]+)"$/i.exec(s))) return (g, c) => leader(g, c).types.some((t) => t.includes(m![1]));
-  if ((m = /^your Leader is \[([^\]]+)\]$/i.exec(s))) return (g, c) => isNamed(leader(g, c), m![1]);
-  if ((m = /^your Leader is multicolored$/i.exec(s))) return (g, c) => leader(g, c).colors.length > 1;
-  const cmp = (word: string, a: number, n: number): boolean => (/less|fewer/.test(word) ? a <= n : a >= n);
-  if ((m = /^you have (\d+) or (less|more|fewer) cards in your hand$/i.exec(s))) return (g, c) => cmp(m![2], P(g, c.player).hand.length, +m![1]);
-  if ((m = /^your opponent has (\d+) or (less|more|fewer) cards in their hand$/i.exec(s))) return (g, c) => cmp(m![2], P(g, opp(c.player)).hand.length, +m![1]);
-  if ((m = /^you have (\d+) or (less|more|fewer) Life cards$/i.exec(s))) return (g, c) => cmp(m![2], P(g, c.player).life.length, +m![1]);
-  if ((m = /^your opponent has (\d+) or (less|more|fewer) Life cards$/i.exec(s))) return (g, c) => cmp(m![2], P(g, opp(c.player)).life.length, +m![1]);
-  if ((m = /^you have (\d+) or (less|more|fewer) DON!! cards on your field$/i.exec(s))) {
-    return (g, c) => {
-      const p = P(g, c.player);
-      return cmp(m![2], p.donActive + p.donRested + p.leader.don + p.chars.reduce((n, x) => n + x.don, 0), +m![1]);
-    };
-  }
-  if ((m = /^you have (\d+) or (less|more|fewer) Characters$/i.exec(s))) return (g, c) => cmp(m![2], P(g, c.player).chars.length, +m![1]);
-  if ((m = /^your opponent has (\d+) or (less|more|fewer) Characters$/i.exec(s))) return (g, c) => cmp(m![2], P(g, opp(c.player)).chars.length, +m![1]);
-  if ((m = /^you have (\d+) or (less|more|fewer) cards in your trash$/i.exec(s))) return (g, c) => cmp(m![2], P(g, c.player).trash.length, +m![1]);
-  if ((m = /^there is a Character with a cost of (\d+) or more$/i.exec(s))) return (g) => ([0, 1] as const).some((p) => P(g, p).chars.some((x) => costOf(g, x) >= +m![1]));
-  if ((m = /^there is a Character with a cost of (\d+)$/i.exec(s))) return (g) => ([0, 1] as const).some((p) => P(g, p).chars.some((x) => costOf(g, x) === +m![1]));
-  if (/^you have less Life cards than your opponent$/i.test(s)) return (g, c) => P(g, c.player).life.length < P(g, opp(c.player)).life.length;
-  if (/^you have (\d+) or more rested DON!! cards$/i.test(s)) {
-    const n = +/(\d+)/.exec(s)![1];
-    return (g, c) => P(g, c.player).donRested >= n;
-  }
-  return null;
-}
-
-function parseCost(input: string, k: CostSpec): boolean {
-  for (const part of input.split(/ and /i)) {
-    const s = part.trim();
-    let m: RegExpExecArray | null;
-    if ((m = /^trash (\d+) cards? from your hand$/i.exec(s))) k.trashHand = (k.trashHand ?? 0) + +m[1];
-    else if ((m = /^trash (\d+) (.+?) from your hand$/i.exec(s))) {
-      const f = parseCardFilter(m[2]);
-      if (!f || k.trashHand) return false;
-      k.trashHand = +m[1];
-      k.trashFilter = f;
-      k.trashDesc = m[2];
-    } else if (/^rest this (Character|Stage|Leader|card)$/i.test(s)) k.restSelf = true;
-    else if ((m = /^rest (\d+) of your DON!! cards$/i.exec(s))) k.don = (k.don ?? 0) + +m[1];
-    else if (/^add 1 card from the top or bottom of your Life cards to your hand$/i.test(s)) k.lifeToHand = true;
-    else return false;
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------- effect sentences
-
-let condSeq = 0;
-/** Runs `steps` only when `test` held at the moment the effect reached this point. */
-function guarded(test: Test, steps: Step[]): Step[] {
-  const key = `cond${condSeq++}`;
-  return [
-    (g, c) => {
-      c.v[key] = test(g, c) ? 1 : 0;
-    },
-    ...steps.map<Step>((s) => (g, c) => (c.v[key] ? s(g, c) : undefined)),
-  ];
-}
-
-function parseEffect(sentence: string, timing: Timing | null, next: string | undefined): (Parsed & { consumed?: number }) | null {
-  const s = sentence.trim().replace(/\.$/, '');
-  const text = `${s}.`;
-  let m: RegExpExecArray | null;
-  const n = (x: string): number => +x;
-
-  if ((m = /^draw (\d+) cards? and trash (\d+) cards? from your hand$/i.exec(s))) return { steps: [fx.drawN(n(m[1])), ...fx.discard(n(m[2]))], tags: ['draw'] };
-  if ((m = /^draw (\d+) cards?$/i.exec(s))) return { steps: [fx.drawN(n(m[1]))], tags: ['draw'] };
-  if ((m = /^trash (\d+) cards? from your hand$/i.exec(s))) return { steps: fx.discard(n(m[1])), tags: ['discard'] };
-  if ((m = /^your opponent trashes (\d+) cards? from their hand$/i.exec(s))) return { steps: fx.oppDiscard(n(m[1])), tags: ['disrupt'] };
-  if ((m = /^trash (\d+) cards? from the top of your deck$/i.exec(s))) return { steps: [fx.millSelf(n(m[1]))], tags: ['mill'] };
-
-  if ((m = /^KO up to (\d+) of your opponent's (rested |active )?Characters(.*)$/i.exec(s))) {
-    const f = parseFieldFilter(m[3]);
-    if (!f) return null;
-    const state = (m[2] ?? '').trim().toLowerCase();
-    return { steps: fx.koOpp(text.replace(/^KO/, 'K.O.'), (g, t, c) => (state === 'rested' ? t.rested : state === 'active' ? !t.rested : true) && f(g, t, c), n(m[1])), tags: ['ko'] };
-  }
-  if ((m = /^return up to (\d+) (of your opponent's )?Characters?(.*) to the owner's hand$/i.exec(s))) {
-    const f = parseFieldFilter(m[3]);
-    if (!f) return null;
-    return { steps: m[2] ? fx.removeOpp(text, 'hand', f, n(m[1])) : fx.removeAny(text, 'hand', f, n(m[1])), tags: ['bounce'] };
-  }
-  if ((m = /^place up to (\d+) (of your opponent's )?Characters?(.*) at the bottom of the owner's deck$/i.exec(s))) {
-    const f = parseFieldFilter(m[3]);
-    if (!f) return null;
-    return { steps: m[2] ? fx.removeOpp(text, 'bottom', f, n(m[1])) : fx.removeAny(text, 'bottom', f, n(m[1])), tags: ['bounce'] };
-  }
-  if ((m = /^rest up to (\d+) of your opponent's DON!! cards$/i.exec(s))) return { steps: [fx.restOppDon(n(m[1]))], tags: ['rest'] };
-  if ((m = /^rest up to (\d+) of your opponent's Characters(.*)$/i.exec(s))) {
-    const f = parseFieldFilter(m[2]);
-    if (!f) return null;
-    return { steps: fx.restOpp(text, f, n(m[1])), tags: ['rest'] };
-  }
-  if ((m = /^up to (\d+) of your opponent's rested Characters(.*) will not become active in your opponent's next Refresh Phase$/i.exec(s))) {
-    const f = parseFieldFilter(m[2]);
-    if (!f) return null;
-    return {
-      steps: [
-        fx.pickOpp(n(m[1]), text, 'freeze', (g, t, c) => t.rested && f(g, t, c)),
-        fx.each((g, c, u) => {
-          const t = findField(g, u);
-          if (!t) return;
-          t.frozen = true;
-          log(g, c.player, `${D(t.id).name} will not become active in its owner's next Refresh Phase.`, 'effect');
-        }),
-      ],
-      tags: ['rest'],
-    };
-  }
-  if ((m = /^give up to (\d+) of your opponent's (Characters|Leader or Character cards) [-−](\d+) (power|cost) during this turn$/i.exec(s))) {
-    return { steps: fx.statOpp(m[4].toLowerCase() as 'power' | 'cost', -n(m[3]), 'turn', text, { leader: /Leader/i.test(m[2]), max: n(m[1]) }), tags: ['debuff'] };
-  }
-
-  if ((m = /^up to (\d+) of your Leader or Character(?:s| cards) gains? \+(\d+) power during this (battle|turn)$/i.exec(s))) {
-    const until = m[3].toLowerCase() as Until;
-    if ((timing === 'counter' || timing === 'onOppAttack') && until === 'battle') return { steps: [fx.buffBattle(n(m[2]))], tags: ['buff'], boost: n(m[2]) };
-    return { steps: fx.buffOwn(n(m[2]), until, text, { leader: true, max: n(m[1]) }), tags: ['buff'] };
-  }
-  if ((m = /^up to (\d+) of your Characters gains? \+(\d+) power during this (battle|turn)$/i.exec(s))) {
-    return { steps: fx.buffOwn(n(m[2]), m[3].toLowerCase() as Until, text, { leader: false, max: n(m[1]) }), tags: ['buff'] };
-  }
-  if ((m = /^add up to (\d+) DON!! cards? as rested from your DON!! deck$/i.exec(s))) return { steps: [fx.addDon(n(m[1]), false)], tags: ['ramp'] };
-  if ((m = /^(?:your Leader|up to 1 of your Leader) gains \+(\d+) power during this (battle|turn)$/i.exec(s))) {
-    const amount = n(m[1]);
-    const until = m[2].toLowerCase() as Until;
-    return {
-      steps: [
-        (g, c) => {
-          const L = P(g, c.player).leader;
-          L.mods.push({ stat: 'power', amount, until });
-          log(g, c.player, `${D(L.id).name} gets +${amount} power (now ${powerOf(g, L)}).`, 'effect');
-        },
-      ],
-      tags: ['buff'],
-      boost: timing === 'counter' ? amount : undefined,
-    };
-  }
-  if ((m = /^this (?:Character|Leader|card) gains \+(\d+) power during this (battle|turn)$/i.exec(s))) return { steps: [fx.buffSelf(n(m[1]), m[2].toLowerCase() as Until)], tags: ['buff'] };
-  if ((m = /^this (?:Character|Leader|card) gains \[(Rush|Blocker|Banish|Double Attack|Unblockable)\] during this (battle|turn)$/i.exec(s))) {
-    return { steps: [fx.flagSelf(m[1] as Keyword, m[2].toLowerCase() as Until)], tags: ['buff'] };
-  }
-  if (/^set this (Character|Leader|card) as active$/i.test(s)) return { steps: [fx.setActiveSelf], tags: ['untap'] };
-  if (/^your opponent cannot activate \[Blocker\] during this battle$/i.test(s)) return { steps: [fx.noBlocker()], tags: ['evasion'] };
-
-  if ((m = /^look at (\d+) cards from the top of your deck; reveal up to 1 (.+?) and add it to your hand$/i.exec(s))) {
-    const f = parseCardFilter(m[2]);
-    const nx = (next ?? '').trim().replace(/\.$/, '').replace(/^then, /i, '');
-    const rest = /^place the rest at the bottom of your deck in any order$/i.test(nx) ? 'bottom' : /^trash the rest$/i.test(nx) ? 'trash' : null;
-    if (!f || !rest) return null;
-    return { steps: fx.searchTop(n(m[1]), f, m[2], rest), tags: ['search'], consumed: 1 };
-  }
-  if ((m = /^look at (\d+) cards from the top of your deck and place them at the top or bottom of the deck in any order$/i.exec(s))) return { steps: fx.scry(n(m[1])), tags: ['filter'] };
-  if (/^look at up to 1 card from the top of your or your opponent's Life cards,? and place it at the top or bottom of the Life cards$/i.test(s)) return { steps: fx.lifeLook, tags: ['life'] };
-
-  if ((m = /^add up to (\d+) DON!! cards? from your DON!! deck and (set (?:it|them) as active|rest (?:it|them))$/i.exec(s))) {
-    return { steps: [fx.addDon(n(m[1]), /active/i.test(m[2]))], tags: ['ramp'] };
-  }
-  if ((m = /^set up to (\d+) of your DON!! cards as active$/i.exec(s))) return { steps: [fx.untapDon(n(m[1]))], tags: ['ramp'] };
-  if ((m = /^give up to (\d+) rested DON!! cards? to your Leader or 1 of your Characters$/i.exec(s))) {
-    return { steps: fx.giveRestedDon(n(m[1]), text, { leader: true }), tags: ['don'] };
-  }
-  if ((m = /^give up to (\d+) rested DON!! cards? to your Leader$/i.exec(s))) return { steps: fx.giveRestedDon(n(m[1]), text, { leader: true, chars: false }), tags: ['don'] };
-  if ((m = /^give this Leader or 1 of your Characters up to (\d+) rested DON!! cards?$/i.exec(s))) return { steps: fx.giveRestedDon(n(m[1]), text, { leader: true }), tags: ['don'] };
-
-  if (/^play this card$/i.test(s)) return { steps: [fx.playSelf], tags: ['play'] };
-  if ((m = /^activate this card's \[(Main|Counter|On Play|On KO)\] effect$/i.exec(s))) return { steps: [], tags: [], ref: TIMINGS[m[1] === 'On KO' ? 'On K.O.' : m[1]] };
-  if ((m = /^play up to 1 (.+?) from your (hand|trash)( rested)?$/i.exec(s))) {
-    const f = parseCardFilter(m[1]);
-    if (!f) return null;
-    return { steps: fx.playFrom(m[2].toLowerCase() as 'hand' | 'trash', f, m[1], !!m[3]), tags: ['play'] };
-  }
-  if ((m = /^add up to 1 (.+?) from your trash to your hand$/i.exec(s))) {
-    const f = parseCardFilter(m[1]);
-    if (!f) return null;
-    return { steps: fx.recover(f, m[1]), tags: ['recover'] };
-  }
-  if ((m = /^add up to (\d+) cards? from the top of your deck to the top of your Life cards$/i.exec(s))) return { steps: [fx.gainLife(n(m[1]))], tags: ['life'] };
-  if (/^add 1 card from the top of your Life cards to your hand$/i.test(s)) return { steps: [fx.lifeTopToHand], tags: ['life'] };
-  if ((m = /^trash up to (\d+) cards? from the top of your opponent's Life cards$/i.exec(s))) return { steps: [fx.trashOppLife(n(m[1]))], tags: ['life'] };
-  return null;
-}
-
-// ---------------------------------------------------------------- lines
+const ctxOf = (self: FieldCard): Ctx => mkCtx(ownerOf(self.uid), self.uid, self.id);
 
 const circled = (ch: string): number => {
   const code = ch.codePointAt(0) ?? 0;
@@ -319,61 +74,239 @@ const circled = (ch: string): number => {
   return 0;
 };
 
-const splitSentences = (body: string): string[] =>
-  body
-    .replace(/K\.O\.'d/g, "KO'd")
-    .replace(/K\.O\./g, 'KO')
-    .split(/(?<=\.)\s+|,? and then |, then /)
-    .map((x) => x.trim())
-    .filter(Boolean);
+// ---------------------------------------------------------------- costs
+
+/** The costs the engine has always known by name. Kept as plain fields so the AI can reason about them. */
+function simpleCost(input: string, k: CostSpec): boolean {
+  let resting = false;
+  for (const part of input.split(/ and /i)) {
+    const s = part.trim();
+    let m: RegExpExecArray | null;
+    if (resting && /^this (Character|Stage|Leader|card)$/i.test(s)) {
+      k.restSelf = true;
+      continue;
+    }
+    resting = /^rest /i.test(s);
+    if ((m = /^trash (\d+) cards? from your hand$/i.exec(s))) {
+      if (k.trashFilter) return false;
+      k.trashHand = (k.trashHand ?? 0) + +m[1];
+    } else if (/^rest this (Character|Stage|Leader|card)$/i.test(s)) k.restSelf = true;
+    else if ((m = /^rest (\d+) of your DON!! cards$/i.exec(s))) k.don = (k.don ?? 0) + +m[1];
+    else if (/^add 1 card from the top or bottom of your Life cards to your hand$/i.test(s)) k.lifeToHand = true;
+    else if ((m = /^return (\d+)(?: or more)? DON!! cards? from your field to your DON!! deck$/i.exec(s))) k.donMinus = (k.donMinus ?? 0) + +m[1];
+    else return false;
+  }
+  return true;
+}
+
+function parseCost(input: string, k: CostSpec): boolean {
+  const trial: CostSpec = {};
+  if (simpleCost(input, trial)) {
+    k.trashHand = trial.trashHand ?? k.trashHand;
+    k.restSelf = trial.restSelf ?? k.restSelf;
+    k.don = (k.don ?? 0) + (trial.don ?? 0) || undefined;
+    k.lifeToHand = trial.lifeToHand ?? k.lifeToHand;
+    k.donMinus = (k.donMinus ?? 0) + (trial.donMinus ?? 0) || undefined;
+    for (const key of Object.keys(k) as (keyof CostSpec)[]) if (k[key] === undefined) delete k[key];
+    return true;
+  }
+  const act = parseClause(input, { timing: null });
+  if (!act || !act.can || act.consumed) return false;
+  (k.extra ??= []).push({ text: input.replace(/\bKO\b/g, 'K.O.'), can: act.can, steps: act.steps });
+  return true;
+}
+
+// ---------------------------------------------------------------- "When ..." reactions
+
+type Match = (g: Game, self: FieldCard, ev: GameEvent) => boolean;
+interface Reaction {
+  event: EventType;
+  match: Match;
+}
+
+function parseEvent(input: string): Reaction[] | null {
+  const s = input.trim();
+  const owner = (self: FieldCard): number => ownerOf(self.uid);
+  const mine: Match = (_g, self, ev) => ev.player === owner(self);
+  const theirs: Match = (_g, self, ev) => ev.player !== owner(self);
+  const one = (event: EventType, match: Match): Reaction[] => [{ event, match }];
+  const how = (suffix: string | undefined): ((ev: GameEvent, self: FieldCard) => boolean) => {
+    const x = (suffix ?? '').toLowerCase();
+    if (x.includes("opponent's effect")) return (ev, self) => ev.how === 'effect' && ev.by !== owner(self);
+    if (x.includes('effect')) return (ev) => ev.how === 'effect';
+    if (x.includes('battle')) return (ev) => ev.how === 'battle';
+    return () => true;
+  };
+  let m: RegExpExecArray | null;
+
+  if ((m = /^(?:a|(\d+) or more) DON!! cards? on (?:your|the) field (?:is|are) returned to your DON!! deck( by your effect)?$/i.exec(s))) {
+    const n = m[1] ? +m[1] : 1;
+    const byMe = !!m[2];
+    return one('donReturned', (_g, self, ev) => ev.player === owner(self) && ev.n >= n && (!byMe || ev.by === owner(self)));
+  }
+  if (/^this Leader or any of your Characters is given a DON!! card$/i.test(s)) return one('donGiven', mine);
+  if ((m = /^this Character is KO'd( by your opponent's effect| by an effect| in battle)?$/i.exec(s))) {
+    const h = how(m[1]);
+    return one('ko', (_g, self, ev) => ev.uid === self.uid && h(ev, self));
+  }
+  if (/^this Character battles and KO's your opponent's Character$/i.test(s)) return one('ko', (_g, self, ev) => ev.how === 'battle' && ev.other === self.uid && ev.player !== owner(self));
+  if (/^a Character is KO'd$/i.test(s)) return one('ko', () => true);
+  if (/^your opponent's Character is KO'd$/i.test(s)) return one('ko', theirs);
+  if ((m = /^(?:one of )?your (.+?) is KO'd( by your opponent's effect| by an effect| in battle)?$/i.exec(s))) {
+    const d = parseDesc(m[1]);
+    const h = how(m[2]);
+    return d ? one('ko', (g, self, ev) => ev.player === owner(self) && h(ev, self) && d.pred(g, ctxOf(self), ev.uid)) : null;
+  }
+  if (/^a Character is removed from the field by your effect$/i.test(s)) return one('removed', (_g, self, ev) => ev.by === owner(self));
+  if ((m = /^your opponent's Character is (removed from the field|returned to the owner's hand) by your effect$/i.exec(s))) {
+    const hand = /hand/i.test(m[1]);
+    return one('removed', (_g, self, ev) => ev.player !== owner(self) && ev.by === owner(self) && (!hand || ev.how === 'hand'));
+  }
+  if ((m = /^your (.+?) is removed from the field by (an|your opponent's) effect$/i.exec(s))) {
+    const d = parseDesc(m[1]);
+    const foe = /opponent/i.test(m[2]);
+    return d ? one('removed', (g, self, ev) => ev.player === owner(self) && (!foe || ev.by !== owner(self)) && d.pred(g, ctxOf(self), ev.uid)) : null;
+  }
+  if (/^you activate an Event$/i.test(s)) return one('useEvent', mine);
+  if (/^your opponent activates an Event$/i.test(s)) return one('useEvent', theirs);
+  if (/^your opponent activates (?:an? )?\[Blocker\]$/i.test(s)) return one('useBlocker', theirs);
+  if (/^your opponent activates (?:(?:an? )?\[Blocker\] or an Event|an Event or (?:an? )?\[Blocker\])$/i.test(s)) return [...one('useEvent', theirs), ...one('useBlocker', theirs)];
+  if ((m = /^you play a (Character.*?)( from your hand)?$/i.exec(s))) {
+    const d = parseDesc(m[1]);
+    const hand = !!m[2];
+    return d ? one('playChar', (g, self, ev) => ev.player === owner(self) && (!hand || ev.how === 'hand') && d.pred(g, ctxOf(self), ev.uid)) : null;
+  }
+  if (/^your opponent plays a Character$/i.test(s)) return one('playChar', theirs);
+  if ((m = /^an? (.+?) is played from your trash$/i.exec(s))) {
+    const d = parseDesc(m[1]);
+    return d ? one('playChar', (g, self, ev) => ev.player === owner(self) && ev.how === 'trash' && d.pred(g, ctxOf(self), ev.uid)) : null;
+  }
+  if (/^this (?:Character|Leader)'s attack deals damage to your opponent's Life$/i.test(s)) return one('damage', (_g, self, ev) => ev.uid === self.uid);
+  if (/^you deal damage to your opponent's Life$/i.test(s)) return one('damage', theirs);
+  if (/^you take damage$/i.test(s)) return one('damage', mine);
+  if (/^a card is removed from your or your opponent's Life cards$/i.test(s)) return one('lifeLost', () => true);
+  if (/^a card is removed from your opponent's Life cards$/i.test(s)) return one('lifeLost', theirs);
+  if (/^a card is removed from your Life cards$/i.test(s)) return one('lifeLost', mine);
+  if (/^a card is added to your hand from your Life(?: cards)?$/i.test(s)) return one('lifeToHand', mine);
+  if (/^this (?:Character|Leader) becomes rested$/i.test(s)) return one('rested', (_g, self, ev) => ev.uid === self.uid);
+  if (/^a \[Trigger\] activates$/i.test(s)) return one('trigger', () => true);
+  if (/^this (?:Leader|Character) attacks or is attacked$/i.test(s)) return one('attack', (_g, self, ev) => ev.uid === self.uid || ev.other === self.uid);
+  if (/^this (?:Leader|Character) attacks your opponent's Leader$/i.test(s)) return one('attack', (g, self, ev) => ev.uid === self.uid && isLeader(g, ev.other));
+  if (/^you draw a card outside of your Draw Phase$/i.test(s)) return one('drawFx', mine);
+  if (/^a card is trashed from your hand(?: by an effect)?$/i.test(s)) return one('handTrashed', mine);
+  if (/^your opponent attacks$/i.test(s)) return one('attack', theirs);
+  if (/^your opponent's Character attacks$/i.test(s)) return one('attack', (g, self, ev) => ev.player !== owner(self) && !isLeader(g, ev.uid));
+  if (/^your opponent activates an Event or (?:a )?\[Trigger\]$/i.test(s)) return [...one('useEvent', theirs), ...one('trigger', theirs)];
+  if (/^this (?:Character|Leader) (?:becomes|is) rested by your opponent's (?:Character's )?effect$/i.test(s)) return one('rested', (_g, self, ev) => ev.uid === self.uid && ev.by !== owner(self) && ev.how === 'effect');
+  // "When A or B, ..."
+  const om = /^(.+?),? or (?:when )?(.+)$/i.exec(s);
+  if (om) {
+    const [a, b] = [parseEvent(om[1]), parseEvent(om[2])];
+    if (a && b) return [...a, ...b];
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------- "If ... would be K.O.'d, you may ... instead"
+
+type CauseTest = (cause: RemovalCause) => boolean;
+function parseCause(verb: string, tail: string): CauseTest | null {
+  const v = verb.toLowerCase();
+  const t = tail.trim().toLowerCase();
+  const by = (x: string): CauseTest | null =>
+    x === ''
+      ? () => true
+      : x === 'in battle'
+        ? (c) => c.battle
+        : x === 'by an effect' || x === 'by effects'
+          ? (c) => !c.battle
+          : x === "by your opponent's effect" || x === "by your opponent's effects" || x === 'by your opponent'
+            ? (c) => !c.battle && c.byOpp
+            : null;
+  if (v === 'leave the field') return t === '' ? () => true : null;
+  if (v === 'removed from the field') {
+    const km = /^(.*?)\s*or ko'd$/.exec(t);
+    if (km) {
+      const b = by(km[1].trim());
+      return b ? (c) => c.mode === 'ko' || b(c) : null;
+    }
+    return by(t);
+  }
+  // K.O.'d, possibly "... or would be removed from the field by your opponent's effect"
+  const om = /^(.*?)\s*or (?:would be )?removed from the field (by your opponent's effects?)$/.exec(t);
+  if (om) {
+    const b = by(om[1].trim());
+    return b ? (c) => (c.mode === 'ko' && b(c)) || (!c.battle && c.byOpp) : null;
+  }
+  const b = by(t);
+  return b ? (c) => c.mode === 'ko' && b(c) : null;
+}
+
+function parseVictim(input: string): ((g: Game, self: FieldCard, victim: FieldCard) => boolean) | null {
+  const s = input.trim();
+  if (/^this (Character|card)$/i.test(s)) return (_g, self, victim) => victim.uid === self.uid;
+  const m = /^(?:one of |any of )?your (.+)$/i.exec(s);
+  const d = m ? parseDesc(m[1]) : null;
+  if (!d) return null;
+  return (g, self, victim) => ownerOf(victim.uid) === ownerOf(self.uid) && !isLeader(g, victim.uid) && P(g, ownerOf(victim.uid)).stage?.uid !== victim.uid && d.pred(g, ctxOf(self), victim.uid);
+}
+
+// ---------------------------------------------------------------- the compiler
 
 export function compileCard(raw: RawCard): Compiled {
   const out: Compiled = { ok: true, unparsed: [], keywords: [], effects: [], aliases: [] };
   const powerAuras: NonNullable<CardDef['powerAura']>[] = [];
-  const kwAuras: NonNullable<CardDef['dynKeyword']>[] = [];
   const costAuras: NonNullable<CardDef['costAura']>[] = [];
+  const flagAuras: NonNullable<CardDef['flagAura']>[] = [];
+  const selfKw: NonNullable<CardDef['dynKeyword']>[] = [];
+  const handCosts: NonNullable<CardDef['handCost']>[] = [];
+  const handAuras: NonNullable<CardDef['handAura']>[] = [];
+  const replaces: ReplaceDef[] = [];
   const refs: { effect: EffectDef; ref: Timing }[] = [];
   const fail = (line: string): void => {
     out.ok = false;
     out.unparsed.push(line);
   };
 
-  for (const line of raw.text.split('\n').map((l) => l.trim()).filter(Boolean)) {
-    let rest = line;
-    let timing: Timing | null = null;
+  // "Choose one:" options are printed as separate "•" lines; fold them back into their sentence.
+  const lines: string[] = [];
+  for (const l of raw.text.split('\n').map((x) => x.trim()).filter(Boolean)) {
+    if (/^(?:[•・]|- )/.test(l) && lines.length) lines[lines.length - 1] += ` ${l.replace(/^(?:・|- )/, '• ')}`;
+    else if (/^Then, /.test(l) && lines.length) lines[lines.length - 1] += ` ${l}`;
+    else lines.push(l);
+  }
+
+  for (const line of lines) {
+    let rest = normalise(line);
+    const timings: Timing[] = [];
     let don = 0;
     let opt = false;
     let yourTurn = false;
     let oppTurn = false;
     const cost: CostSpec = {};
     const kws: Keyword[] = [];
-    let bad = false;
     for (;;) {
-      const m = /^\s*(?:\[([^\]]+)\]|DON!! ?[-−–](\d+)|([①-⑩❶-➓]))\s*:?\s*/.exec(rest);
+      const m = /^\s*(?:\[([^\]]+)\]|DON!! ?-(\d+)|([①-⑩❶-➓]))\s*[:/,]?\s*/.exec(rest);
       if (!m) break;
       if (m[1] !== undefined) {
         const tag = m[1];
         const dm = /^DON!! ?x(\d+)$/i.exec(tag);
-        if (TIMINGS[tag]) {
-          if (timing) bad = true;
-          timing = TIMINGS[tag];
-        } else if (dm) don = +dm[1];
+        if (TIMINGS[tag]) timings.push(TIMINGS[tag]);
+        else if (dm) don = +dm[1];
         else if (tag === 'Once Per Turn') opt = true;
         else if (tag === 'Your Turn') yourTurn = true;
         else if (tag === "Opponent's Turn") oppTurn = true;
-        else if ((KEYWORDS as string[]).includes(tag) && !timing && !don) kws.push(tag as Keyword);
+        else if ((KW as string[]).includes(tag) && !timings.length && !don) kws.push(tag as Keyword);
         else break; // a [Card Name] at the start of a sentence — part of the body
       } else if (m[2] !== undefined) cost.donMinus = +m[2];
       else if (m[3] !== undefined) cost.don = circled(m[3]);
       rest = rest.slice(m[0].length);
     }
     let body = rest.trim();
-    if (bad) {
-      fail(line);
-      continue;
-    }
+    // Reminder text in brackets after a keyword: "[Blocker] (After your opponent declares an attack, ...)"
+    if (kws.length && /^\(.*\)$/.test(body)) body = '';
     if (!body) {
-      if (kws.length && !timing) out.keywords.push(...kws);
+      if (kws.length && !timings.length) out.keywords.push(...kws);
       else fail(line);
       continue;
     }
@@ -382,110 +315,281 @@ export function compileCard(raw: RawCard): Compiled {
       continue;
     }
 
+    // "Rest 1 of your DON!! cards and you may rest this Character: …" is one cost with the "you may" in the middle.
+    body = body.replace(/^((?:rest|trash|return|place) [^:.]+?) and you may ([^:.]+?): /i, 'You may $1 and $2: ');
     // "You may <cost>: <effect>"
-    const cm = /^You may (.+?): (.+)$/i.exec(body);
+    const cm = /^You may (.+?): (.+)$/is.exec(body);
     if (cm) {
       if (!parseCost(cm[1], cost)) {
+        if (trace.on) trace.misses.push(`cost: ${cm[1]}`);
         fail(line);
         continue;
       }
       body = cm[2];
     }
     const hasCost = Object.keys(cost).length > 0;
-    const sentences = splitSentences(body);
+    const turnGate: Test | undefined = yourTurn ? (g, c) => g.active === c.player : oppTurn ? (g, c) => g.active !== c.player : undefined;
 
-    // ---- continuous effects (no timing word)
-    if (!timing) {
-      if (hasCost || opt || sentences.length !== 1) {
+    const addEffect = (timing: Timing, b: NonNullable<ReturnType<typeof parseBody>>, extra: Partial<EffectDef> = {}): void => {
+      const gates = [turnGate, b.when].filter((x): x is Test => !!x);
+      const e: EffectDef = {
+        timing,
+        text: line,
+        steps: b.steps,
+        tags: b.tags,
+        ...(don ? { don } : {}),
+        ...(opt ? { opt } : {}),
+        ...(hasCost ? { cost } : {}),
+        ...(b.boost !== undefined ? { boost: b.boost } : {}),
+        ...(gates.length ? { when: (g: Game, c: Ctx) => gates.every((t) => t(g, c)) } : {}),
+        ...extra,
+      };
+      out.effects.push(e);
+      if (b.ref) refs.push({ effect: e, ref: b.ref });
+    };
+
+    // ---- triggered / activated effects
+    if (timings.length) {
+      const b = parseBody(body, { timing: timings[0] });
+      if (!b) {
         fail(line);
         continue;
       }
-      let s = sentences[0].replace(/\.$/, '');
-      let cond: Test | null = null;
-      const im = /^If (.+?), (.+)$/i.exec(s);
-      if (im) {
-        cond = parseCond(im[1]);
-        if (!cond) {
-          fail(line);
-          continue;
-        }
-        s = im[2];
-      }
-      const on = (g: Game, self: FieldCard): boolean => {
-        const owner = ownerOf(self.uid);
-        if (self.don < don) return false;
-        if (yourTurn && g.active !== owner) return false;
-        if (oppTurn && g.active === owner) return false;
-        return !cond || cond(g, { player: owner, src: self.uid, cardId: self.id, sel: [], yes: false, idx: 0, v: {}, list: [], jump: -1 });
-      };
-      let m: RegExpExecArray | null;
-      if ((m = /^this (?:Character|Leader) gains \+(\d+) power$/i.exec(s))) {
-        const amount = +m[1];
-        powerAuras.push((g, self, t) => (t.uid === self.uid && on(g, self) ? amount : 0));
-      } else if ((m = /^this (?:Character|Leader) gains \[(Rush|Blocker|Banish|Double Attack|Unblockable)\]$/i.exec(s))) {
-        const kw = m[1] as Keyword;
-        kwAuras.push((g, self, k) => k === kw && on(g, self));
-      } else if ((m = /^this Character gains \+(\d+) cost$/i.exec(s))) {
-        const amount = +m[1];
-        costAuras.push((g, self) => (on(g, self) ? amount : 0));
-      } else if (/^this Character cannot be KO'd by effects$/i.test(s) && !don && !yourTurn && !oppTurn && !cond) out.cantBeKoByEffect = true;
-      else if ((m = /^also treat this card's name as \[([^\]]+)\] according to the rules$/i.exec(s))) out.aliases.push(m[1]);
-      else if (/^this (Leader|Character) cannot attack$/i.test(s) && !don && !yourTurn && !oppTurn && !cond) out.cantAttack = true;
-      else if (/^under the rules of this game, you may have any number of this card in your deck$/i.test(s)) out.anyCopies = true;
-      else fail(line);
+      for (const t of timings) addEffect(t, b);
       continue;
     }
 
-    // ---- triggered / activated effects
-    const steps: Step[] = [];
-    const tags: string[] = [];
-    let boost: number | undefined;
-    let when: Test | undefined;
-    let ref: Timing | undefined;
-    let ok = true;
-    for (let i = 0; i < sentences.length && ok; i++) {
-      let s = sentences[i].replace(/^then, /i, '');
-      let cond: Test | null = null;
-      const im = /^If (.+?), (.+)$/i.exec(s);
-      if (im) {
-        cond = parseCond(im[1]);
-        if (!cond) {
-          ok = false;
-          break;
-        }
-        s = im[2];
+    // ---- reactions: "When X, ..." / "This effect can be activated when X. ..."
+    const wm = /^When (.+?), (.+)$/is.exec(body) ?? /^This effect can be activated when (.+?)\. (.+)$/is.exec(body);
+    if (wm) {
+      const reactions = parseEvent(wm[1]);
+      if (!reactions) {
+        if (trace.on) trace.misses.push(`when: ${wm[1]}`);
+        fail(line);
+        continue;
       }
-      const p = parseEffect(s, timing, sentences[i + 1]);
-      if (!p) {
-        ok = false;
-        break;
+      const b = parseBody(wm[2], { timing: 'event' });
+      if (!b || b.ref) {
+        fail(line);
+        continue;
       }
-      i += p.consumed ?? 0;
-      if (p.ref) ref = p.ref;
-      if (cond && i === (p.consumed ?? 0) && !steps.length) when = cond;
-      steps.push(...(cond ? guarded(cond, p.steps) : p.steps));
-      for (const t of p.tags) if (!tags.includes(t)) tags.push(t);
-      if (p.boost !== undefined) boost = (boost ?? 0) + p.boost;
+      for (const r of reactions) addEffect('event', b, { event: r.event, match: r.match });
+      continue;
     }
-    if (!ok || (ref && sentences.length !== 1)) {
+
+    const sentences = splitSentences(body);
+    if (hasCost || sentences.length !== 1) {
+      if (trace.on) trace.misses.push(`static: ${body}`);
       fail(line);
       continue;
     }
-    const turnGate: Test | undefined = yourTurn ? (g, c) => g.active === c.player : oppTurn ? (g, c) => g.active !== c.player : undefined;
-    const gates = [turnGate, when].filter((x): x is Test => !!x);
-    const e: EffectDef = {
-      timing,
-      text: line,
-      steps,
-      tags,
-      ...(don ? { don } : {}),
-      ...(opt ? { opt } : {}),
-      ...(hasCost ? { cost } : {}),
-      ...(boost !== undefined ? { boost } : {}),
-      ...(gates.length ? { when: (g: Game, c: Ctx) => gates.every((t) => t(g, c)) } : {}),
+    let s = sentences[0].replace(/\.$/, '');
+
+    // ---- replacements
+    const rm = /^If (.+?) would (?:be )?(KO'd|removed from the field|leave the field)(.*?), (?:you may )?(.+?) instead(?: of .+)?$/i.exec(s);
+    if (rm) {
+      let victimText = rm[1];
+      let pre: Test | null = null;
+      const am = /^(.+) and (this Character|your .+)$/i.exec(victimText);
+      if (am && !parseVictim(victimText)) {
+        pre = parseCond(am[1]);
+        victimText = am[2];
+        if (!pre) {
+          if (trace.on) trace.misses.push(`cond: ${am[1]}`);
+          fail(line);
+          continue;
+        }
+      }
+      const victim = parseVictim(victimText);
+      const cause = parseCause(rm[2], rm[3]);
+      const act = parseClause(rm[4], { timing: null });
+      if (!victim || !cause || !act || !act.can || act.consumed) {
+        if (trace.on) trace.misses.push(!victim ? `victim: ${victimText}` : !cause ? `cause: ${rm[2]}${rm[3]}` : `instead: ${rm[4]}`);
+        fail(line);
+        continue;
+      }
+      const can = act.can;
+      replaces.push({
+        text: line,
+        opt,
+        steps: act.steps,
+        can: (g, self, v, c) => {
+          const owner = ownerOf(self.uid);
+          if (self.don < don || (yourTurn && g.active !== owner) || (oppTurn && g.active === owner)) return false;
+          const ctx = ctxOf(self);
+          ctx.v.that = v.uid;
+          return victim(g, self, v) && cause(c) && (!pre || pre(g, ctx)) && can(g, ctx);
+        },
+      });
+      continue;
+    }
+
+    // ---- continuous effects
+    let cond: Test | null = null;
+    const im = /^If (.+?), (.+)$/i.exec(s);
+    if (im) {
+      cond = parseCond(im[1]);
+      if (!cond) {
+        if (trace.on) trace.misses.push(`cond: ${im[1]}`);
+        fail(line);
+        continue;
+      }
+      s = im[2];
+    } else {
+      // "This Character gains [Double Attack] if you have 5 or more cards in your hand."
+      const tm = /^(.+?),? if (.+)$/i.exec(s);
+      const tc = tm ? parseCond(tm[2]) : null;
+      if (tm && tc) {
+        cond = tc;
+        s = tm[1];
+      }
+    }
+    const gated = !!cond || !!don || yourTurn || oppTurn || opt;
+    const on = (g: Game, self: FieldCard): boolean => {
+      const owner = ownerOf(self.uid);
+      if (self.don < don) return false;
+      if (yourTurn && g.active !== owner) return false;
+      if (oppTurn && g.active === owner) return false;
+      return !cond || cond(g, ctxOf(self));
     };
-    out.effects.push(e);
-    if (ref) refs.push({ effect: e, ref });
+    type Who = (g: Game, self: FieldCard, t: FieldCard) => boolean;
+    /** Who a continuous effect applies to. Only "this card", a Leader, or "all of ..." make sense here. */
+    const subject = (text: string): Who | null => {
+      const sels: Sel[] | null = parseSels(text) ?? (/^your /i.test(text.trim()) ? parseSels(`all of ${text.trim()}`) : null);
+      if (!sels || !sels.every((sel) => sel.fixed === 'self' || sel.fixed === 'leader' || sel.fixed === 'oppLeader' || sel.all)) return null;
+      if (sels.some((sel) => sel.fixed === 'oppLeader' || (!sel.fixed && sel.side !== 'own'))) out.auraFoe = true;
+      return (g, self, t) => sels.some((sel) => (sel.fixed === 'self' ? t.uid === self.uid : inSel(g, ctxOf(self), sel, t)));
+    };
+    const kwOf = (name: string): Keyword | undefined => KW.find((k) => k.toLowerCase() === name.toLowerCase());
+    const addStat = (who: Who, stat: string, amount: number): void => {
+      (stat.toLowerCase() === 'power' ? powerAuras : costAuras).push((g, self, t) => (who(g, self, t) && on(g, self) ? amount : 0));
+    };
+    const addFlag = (who: Who, f: Flag): void => {
+      flagAuras.push((g, self, t, flag) => flag === f && who(g, self, t) && on(g, self));
+    };
+    const one = (t: string): boolean => {
+      let m: RegExpExecArray | null;
+      if ((m = /^(?:under the rules of this game, )?also treat this card's name as \[([^\]]+)\](?: and \[([^\]]+)\])?(?: according to the rules)?$/i.exec(t)) && !gated) {
+        out.aliases.push(m[1]);
+        if (m[2]) out.aliases.push(m[2]);
+        return true;
+      }
+      if (/^under the rules of this game, you may have any number of this card in your deck$/i.test(t) && !gated) {
+        out.anyCopies = true;
+        return true;
+      }
+      // cards still in hand
+      if ((m = /^give this card in your hand -(\d+) cost$/i.exec(t))) {
+        const amount = +m[1];
+        handCosts.push((g, pid) => ((!yourTurn || g.active === pid) && (!oppTurn || g.active !== pid) && (!cond || cond(g, mkCtx(pid, 0, raw.id))) ? -amount : 0));
+        return true;
+      }
+      if ((m = /^the cost of playing (.+?) from your hand will be reduced by (\d+)$/i.exec(t)) || (m = /^give (.+?) in your hand -(\d+) cost$/i.exec(t))) {
+        const d = parseDesc(m[1]);
+        if (!d) return false;
+        const amount = +m[2];
+        handAuras.push((g, self, uid) => (on(g, self) && d.cat(D(g.ids[uid])) && d.pred(g, ctxOf(self), uid) ? -amount : 0));
+        return true;
+      }
+      if ((m = /^(.+?) gains? \+(\d+) power(?: and \+(\d+) cost)? for every (\d+ )?(.+)$/i.exec(t))) {
+        const who = subject(m[1]);
+        const count = parseCount(m[5]);
+        if (!who || !count) return false;
+        const [amount, costUp, per] = [+m[2], m[3] ? +m[3] : 0, m[4] ? +m[4] : 1];
+        const times = (g: Game, self: FieldCard): number => Math.floor(count(g, ctxOf(self)) / per);
+        powerAuras.push((g, self, x) => (who(g, self, x) && on(g, self) ? amount * times(g, self) : 0));
+        if (costUp) costAuras.push((g, self, x) => (who(g, self, x) && on(g, self) ? costUp * times(g, self) : 0));
+        return true;
+      }
+      if ((m = /^(.+?) gains? ([-+])(\d+) (power|cost)(?: and ([-+])(\d+) (power|cost))?$/i.exec(t)) || (m = /^give (.+?) ([-+])(\d+) (power|cost)$/i.exec(t))) {
+        const who = subject(m[1]);
+        if (!who) return false;
+        addStat(who, m[4], (m[2] === '-' ? -1 : 1) * +m[3]);
+        if (m[5]) addStat(who, m[7], (m[5] === '-' ? -1 : 1) * +m[6]);
+        return true;
+      }
+      if ((m = new RegExp(`^(.+?) gains? \\[(${KW_RE})\\](?:,? (?:and )?\\[(${KW_RE})\\])?(?: and \\+(\\d+) (power|cost))?$`, 'i').exec(t))) {
+        const who = subject(m[1]);
+        const kws2 = [kwOf(m[2]), m[3] ? kwOf(m[3]) : undefined].filter((k): k is Keyword => !!k);
+        if (!who || !kws2.length) return false;
+        if (/^this (Character|Leader|card)$/i.test(m[1].trim())) selfKw.push((g, self, k) => kws2.includes(k) && on(g, self));
+        else for (const k of kws2) addFlag(who, k);
+        if (m[4]) addStat(who, m[5], +m[4]);
+        return true;
+      }
+      if ((m = new RegExp(`^(.+?) gains? \\+(\\d+) (power|cost) and \\[(${KW_RE})\\]$`, 'i').exec(t))) {
+        const who = subject(m[1]);
+        const kw = kwOf(m[4]);
+        if (!who || !kw) return false;
+        addStat(who, m[3], +m[2]);
+        addFlag(who, kw);
+        return true;
+      }
+      if ((m = /^(.+?) can attack Characters on the turn in which (?:it is|they are) played$/i.exec(t))) {
+        const who = subject(m[1]);
+        if (!who) return false;
+        addFlag(who, 'Rush: Character');
+        return true;
+      }
+      if ((m = /^(.+?) cannot be KO'd( in battle| by effects| by your opponent's effects)?(?: by (?:<(\w+)> attribute (?:cards|Characters|Leaders or Characters)|(Leaders)))?$/i.exec(t))) {
+        const who = subject(m[1]);
+        if (!who) return false;
+        const kind = (m[2] ?? '').toLowerCase();
+        const attr = m[3];
+        const leaders = !!m[4];
+        const f: Flag = kind.includes('battle') || attr || leaders ? 'NoKOBattle' : kind ? 'NoKOEffect' : 'NoKO';
+        if (f === 'NoKOEffect' && /^this Character$/i.test(m[1].trim()) && !gated) out.cantBeKoByEffect = true;
+        flagAuras.push((g, self, x, flag) => {
+          if (flag !== f || !who(g, self, x) || !on(g, self)) return false;
+          if (!attr && !leaders) return true;
+          const atk = g.battle ? g.ids[g.battle.attacker] : undefined;
+          if (!g.battle || !atk) return false;
+          return leaders ? isLeader(g, g.battle.attacker) : (D(atk).attribute as string[]).includes(attr);
+        });
+        return true;
+      }
+      if ((m = /^(.+?) cannot attack$/i.exec(t))) {
+        const who = subject(m[1]);
+        if (!who) return false;
+        if (/^this (Leader|Character)$/i.test(m[1].trim()) && !gated) out.cantAttack = true;
+        else addFlag(who, 'CantAttack');
+        return true;
+      }
+      if ((m = /^(.+?) can(?: also)? attack (?:your opponent's )?active Characters$/i.exec(t))) {
+        const who = subject(m[1]);
+        if (who) addFlag(who, 'AttackActive');
+        return !!who;
+      }
+      if ((m = /^(.+?) cannot be removed from the field by your opponent's effects$/i.exec(t))) {
+        const who = subject(m[1]);
+        if (who) addFlag(who, 'NoRemove');
+        return !!who;
+      }
+      // "Your {X} type Leader's base power becomes 6000." — written as the difference from the printed power.
+      if ((m = /^(?:the base power of (.+?) becomes (\d+)|set the base power of (.+?) to (\d+)|(.+?)(?:'s| cards')? base power becomes (\d+))$/i.exec(t))) {
+        const who = subject(m[1] ?? m[3] ?? m[5]);
+        const amount = +(m[2] ?? m[4] ?? m[6]);
+        if (!who) return false;
+        powerAuras.push((g, self, x) => (who(g, self, x) && on(g, self) ? amount - D(x.id).power : 0));
+        return true;
+      }
+      return false;
+    };
+    let done = one(s);
+    if (!done) {
+      // "This Character cannot be removed ... and gains [Blocker]" — one subject, two statements.
+      const sm = /^(.+?) (?:gains?|cannot|can) /i.exec(s);
+      const cut = /,? and /i.exec(s);
+      const parts = s.split(/,? and /i);
+      if (sm && cut && parts.length === 2) {
+        const second = /^(?:gains?|cannot|can) /i.test(parts[1]) ? `${sm[1]} ${parts[1]}` : parts[1];
+        done = one(parts[0]) && one(second);
+      }
+    }
+    if (!done) {
+      if (trace.on) trace.misses.push(`static: ${s}`);
+      fail(line);
+    }
   }
 
   // "[Trigger] Activate this card's [Main] effect."
@@ -499,15 +603,18 @@ export function compileCard(raw: RawCard): Compiled {
     effect.steps = target.steps;
     effect.tags = target.tags;
     if (!effect.when && target.when) effect.when = target.when;
+    if (!effect.cost && target.cost) effect.cost = target.cost;
   }
 
   if (powerAuras.length) out.powerAura = (g, self, t) => powerAuras.reduce((sum, a) => sum + a(g, self, t), 0);
-  if (kwAuras.length) out.dynKeyword = (g, self, kw) => kwAuras.some((a) => a(g, self, kw));
-  if (costAuras.length) out.costAura = (g, self) => costAuras.reduce((sum, a) => sum + a(g, self), 0);
+  if (costAuras.length) out.costAura = (g, self, t) => costAuras.reduce((sum, a) => sum + a(g, self, t), 0);
+  if (flagAuras.length) out.flagAura = (g, self, t, f) => flagAuras.some((a) => a(g, self, t, f));
+  if (selfKw.length) out.dynKeyword = (g, self, kw) => selfKw.some((a) => a(g, self, kw));
+  if (handCosts.length) out.handCost = (g, pid) => handCosts.reduce((sum, a) => sum + a(g, pid), 0);
+  if (handAuras.length) out.handAura = (g, self, uid) => handAuras.reduce((sum, a) => sum + a(g, self, uid), 0);
+  if (replaces.length) out.replaces = replaces;
   // Cards the engine cannot place yet.
   if (raw.category === 'Event' && !out.effects.some((e) => e.timing === 'main' || e.timing === 'counter')) out.ok = false;
   return out;
 }
 
-// Helpers shared with hand-written card scripts.
-export { leaveField, plural };

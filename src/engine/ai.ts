@@ -16,6 +16,7 @@ import {
   mkCtx,
   opp,
   ownerOf,
+  playCost,
   powerOf,
   totalDon,
   unitsOf,
@@ -147,6 +148,21 @@ function decideSelect(g: Game, me: PlayerId, ch: Extract<Choice, { kind: 'select
       take = Math.min(1, ch.max);
       reason = order.length ? `Bank ${dName(g, order[0])} as a Life card — an extra hit your opponent has to get through.` : '';
       break;
+    case 'sacrifice':
+      // Paying with (or losing) your own cards: give up the least valuable ones, and no more than required.
+      order = [...ch.options].sort((a, b) => fv(a) - fv(b));
+      take = ch.min;
+      reason = order.length && take ? `Give up ${dName(g, order[0])} — the card you will miss least.` : 'Not worth giving up a card for.';
+      break;
+    case 'order': {
+      // Life cards, top first. Your own [Trigger] cards go on top; the opponent's get buried.
+      const trig = (u: number): number => (defOf(g, u).effects?.some((e) => e.timing === 'trigger') ? 1 : 0);
+      const mine = ch.options.length > 0 && ownerOf(ch.options[0]) === me;
+      order = [...ch.options].sort((a, b) => (mine ? trig(b) - trig(a) : trig(a) - trig(b)));
+      take = ch.max;
+      reason = mine ? 'Put your [Trigger] cards on top, so they fire when you take damage.' : 'Bury their [Trigger] cards at the bottom, where they fire last.';
+      break;
+    }
     case 'deckOrder':
       // Cards too expensive to matter soon go to the bottom.
       order = ch.options.filter((u) => defOf(g, u).cost > Math.min(10, totalDon(P(g, me)) + 3));
@@ -168,6 +184,10 @@ function effectFor(key: string | undefined): EffectDef | null {
   return D(id).effects?.[+i] ?? null;
 }
 
+/** Does this text spend one of your own Life cards, or deal damage to you? (Turning Life cards over is free.) */
+const spendsLife = (t: string): boolean => /(?:trash|add) \d+ cards? from the (?:top|bottom|top or bottom) of your Life|you take \d+ damage/i.test(t);
+const gainsLife = (t: string): boolean => /to the (?:top|bottom|top or bottom) of your Life/i.test(t);
+
 function decideConfirm(g: Game, me: PlayerId, ch: Extract<Choice, { kind: 'confirm' }>): Decision {
   const e = effectFor(ch.effectKey);
   const f = g.frames[g.frames.length - 1];
@@ -178,6 +198,9 @@ function decideConfirm(g: Game, me: PlayerId, ch: Extract<Choice, { kind: 'confi
   if (e?.cost?.trashHand && P(g, me).hand.length <= e.cost.trashHand) return ans({ kind: 'confirm', yes: false }, 'It would cost your last card — keep it.');
   if (e?.cost?.donMinus && e.cost.donMinus >= 4 && totalDon(P(g, me)) < 8) return ans({ kind: 'confirm', yes: false }, 'Too much DON!! to give up this early.');
   if (e?.cost?.lifeToHand && P(g, me).life.length <= 1) return ans({ kind: 'confirm', yes: false }, 'Too dangerous to give up Life this low.');
+  // Costs compiled from card text, and "you may …" steps in the middle of an effect.
+  const price = e ? (e.cost?.extra ?? []).map((x) => x.text).join('; ') : ch.prompt;
+  if (spendsLife(price) && P(g, me).life.length <= 1 && !gainsLife(e?.text ?? '')) return ans({ kind: 'confirm', yes: false }, 'Too dangerous to give up Life this low.');
   return ans({ kind: 'confirm', yes: true }, 'The effect is worth more than its cost.');
 }
 
@@ -190,6 +213,41 @@ function decideOption(g: Game, me: PlayerId, ch: Extract<Choice, { kind: 'option
       return ans({ kind: 'option', index: hasTrigger ? 1 : 0 }, hasTrigger ? 'Bury their [Trigger] so it never fires.' : 'A harmless card — leave it on top.');
     case 'linlin':
       return ans({ kind: 'option', index: P(g, me).life.length >= 3 ? 0 : 1 }, P(g, me).life.length >= 3 ? 'You can afford to lose a Life; do not let them heal.' : 'Your Life is too low to give one up.');
+    case 'lifeSpot':
+      return ans({ kind: 'option', index: 1 }, 'The bottom of the Life pile: it is the last card anyone gets back.');
+    case 'guessCost': {
+      // The best blind guess: the most common cost among the cards the opponent has not shown yet.
+      const o = P(g, opp(me));
+      const seen = new Map<number, number>();
+      for (const u of [...o.deck, ...o.hand, ...o.life.map((l) => l.uid)]) {
+        const c = Math.min(ch.labels.length - 1, defOf(g, u).cost);
+        seen.set(c, (seen.get(c) ?? 0) + 1);
+      }
+      let best = 0;
+      for (const [c, n] of seen) if (n > (seen.get(best) ?? 0)) best = c;
+      return ans({ kind: 'option', index: best }, `Guess ${best}: the most common cost among the cards your opponent has not shown yet.`);
+    }
+    case 'chooseOne':
+    case 'chooseOneTheirs': {
+      const o = P(g, opp(me));
+      const theirs = ch.tag === 'chooseOneTheirs';
+      // Labels are written from the effect owner's side; when the opponent's effect makes YOU choose, take the mildest.
+      const victim = theirs ? P(g, me) : o;
+      const score = (label: string): number => {
+        const l = label.toLowerCase();
+        const targets = victim.chars.length > 0;
+        if (/k\.o\./.test(l)) return targets ? 5 : 0.2;
+        if (/to the owner's hand|bottom of the owner's deck|life cards? face-up/.test(l)) return targets ? 4 : 0.2;
+        if (/trash(?:es)? \d+ cards? from (?:their|your) hand/.test(l)) return victim.hand.length ? 3 : 0.2;
+        if (/draw|add up to \d+ don!!/.test(l)) return 3;
+        if (/rest |[-−]\d+ (?:cost|power)/.test(l)) return targets ? 2 : 0.2;
+        return 1;
+      };
+      const scores = ch.labels.map(score);
+      const want = theirs ? Math.min(...scores) : Math.max(...scores);
+      const index = scores.indexOf(want);
+      return ans({ kind: 'option', index }, theirs ? `"${ch.labels[index]}" hurts you least.` : `"${ch.labels[index]}" does the most here.`);
+    }
     default:
       return ans({ kind: 'option', index: 0 }, 'Default choice.');
   }
@@ -371,6 +429,9 @@ function activateScore(g: Game, me: PlayerId, fc: FieldCard, e: EffectDef): numb
   return s;
 }
 
+/** Does paying for this effect use something up, so that it cannot be repeated without end? */
+const consumes = (e: EffectDef): boolean => !!e.cost && !!(e.cost.don || e.cost.restSelf || e.cost.trashHand || e.cost.donMinus || e.cost.lifeToHand);
+
 const PRE_TAGS = ['ramp', 'search', 'draw', 'ko', 'bounce', 'debuff', 'life', 'play', 'recover', 'filter'];
 
 function playScore(g: Game, me: PlayerId, uid: number): number {
@@ -459,6 +520,8 @@ function decideMain(g: Game, me: PlayerId, level: Level, rnd: () => number): Dec
       return { a, fc, e, s: activateScore(g, me, fc, e), pre: (e.tags ?? []).some((t) => PRE_TAGS.includes(t)) };
     })
     .filter((x) => x.s > 0)
+    // An effect with no real price could be activated forever: once a turn is enough.
+    .filter((x) => x.e.opt || consumes(x.e) || !x.fc.used.includes(effectKey(x.fc.id, x.a.idx)))
     .sort((x, y) => y.s - x.s);
   const pre = activations.find((x) => x.pre);
   if (pre) return { action: pre.a, reason: `Use ${D(pre.fc.id).name}'s effect first — it sets up the rest of your turn. (${pre.e.text})` };
@@ -472,10 +535,11 @@ function decideMain(g: Game, me: PlayerId, level: Level, rnd: () => number): Dec
       .sort((x, y) => y.s - x.s);
     if (plays.length) {
       const d = defOf(g, plays[0].u);
-      const left = p.donActive - d.cost;
+      const cost = playCost(g, me, plays[0].u);
+      const left = p.donActive - cost;
       const why =
         d.category === 'Character'
-          ? `Play ${d.name} (cost ${d.cost}): the best use of your ${p.donActive} DON!!${left > 0 ? `, leaving ${left} for more plays or to power up attacks` : ' — you spend them all, which is what you want most turns'}.`
+          ? `Play ${d.name} (cost ${cost}): the best use of your ${p.donActive} DON!!${left > 0 ? `, leaving ${left} for more plays or to power up attacks` : ' — you spend them all, which is what you want most turns'}.`
           : d.category === 'Stage'
             ? `Play the Stage ${d.name}: it stays in play and gives value every turn.`
             : `Play ${d.name} now: its effect has a good target.`;
@@ -490,8 +554,12 @@ function decideMain(g: Game, me: PlayerId, level: Level, rnd: () => number): Dec
   if (p.turns <= 1) return { action: { type: 'end' }, reason: 'Nobody can attack on their first turn, so end the turn. (DON!! you did not spend is simply not used.)' };
 
   // 4. Attacks.
-  const reserveCard = level === 'hard' && p.life.length <= 3 ? p.hand.map((u) => defOf(g, u)).find((d) => d.category === 'Event' && d.effects?.some((e) => e.timing === 'counter' && (e.boost ?? 0) >= 3000) && d.cost <= 2) : undefined;
-  const reserve = reserveCard ? Math.min(reserveCard.cost, p.donActive) : 0;
+  const reserveCard = level === 'hard' && p.life.length <= 3 ? p.hand.find((u) => {
+          const d = defOf(g, u);
+          return d.category === 'Event' && !!d.effects?.some((e) => e.timing === 'counter' && (e.boost ?? 0) >= 3000) && playCost(g, me, u) <= 2;
+        })
+      : undefined;
+  const reserve = reserveCard !== undefined ? Math.min(playCost(g, me, reserveCard), p.donActive) : 0;
   let freeDon = p.donActive - reserve;
   const plan = planAttacks(g, me, level, freeDon);
   const ready = unitsOf(g, me).filter((u) => !whyCantAttack(g, u.uid));
@@ -532,7 +600,7 @@ function decideMain(g: Game, me: PlayerId, level: Level, rnd: () => number): Dec
         const now = powerOf(g, weakest) + 1000;
         return {
           action: { type: 'don', target: weakest.uid, n: 1 },
-          reason: `Give 1 DON!! to ${D(weakest.id).name} (→ ${k(now)}). Every +1000 on an attack forces your opponent to find +1000 more counter; a ${k(now)} swing into a ${k(plan.leaderPower)} Leader costs them ${k(now - plan.leaderPower + 1000)} to stop.${reserve ? ` (Keeping ${reserve} DON!! back for ${reserveCard!.name}.)` : ''}`,
+          reason: `Give 1 DON!! to ${D(weakest.id).name} (→ ${k(now)}). Every +1000 on an attack forces your opponent to find +1000 more counter; a ${k(now)} swing into a ${k(plan.leaderPower)} Leader costs them ${k(now - plan.leaderPower + 1000)} to stop.${reserve ? ` (Keeping ${reserve} DON!! back for ${dName(g, reserveCard!)}.)` : ''}`,
         };
       }
     }

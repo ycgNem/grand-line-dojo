@@ -18,10 +18,15 @@ import type {
   Flag,
   Frame,
   Game,
+  GameEvent,
   Keyword,
   LogKind,
   PlayerId,
+  PlayerRule,
   PlayerState,
+  RemovalCause,
+  ReplaceDef,
+  Span,
   Step,
   Timing,
   Until,
@@ -108,21 +113,42 @@ export const isLeader = (g: Game, uid: number): boolean => P(g, ownerOf(uid)).le
 /** Leader + Characters of a player (the cards that have power). */
 export const unitsOf = (g: Game, p: PlayerId): FieldCard[] => [P(g, p).leader, ...P(g, p).chars];
 
+/** Every card a player has on the field: Leader, Characters and Stage. */
+export const fieldCards = (g: Game, p: PlayerId): FieldCard[] => {
+  const q = P(g, p);
+  return q.stage ? [q.leader, ...q.chars, q.stage] : [q.leader, ...q.chars];
+};
+
+export const hasFlag = (fc: FieldCard, flag: Flag): boolean => fc.flags.some((f) => f.flag === flag);
+/** "Negate the effect of ..." — the card keeps its power and cost but none of its text works. */
+export const isNegated = (fc: FieldCard): boolean => hasFlag(fc, 'Negated');
+
+// Continuous effects can look at other cards' power and cost, which are themselves changed by
+// continuous effects. The depth counter stops that from going round in circles.
+let auraDepth = 0;
+function auraSum(g: Game, fc: FieldCard, pick: (d: CardDef, src: FieldCard) => number): number {
+  if (auraDepth >= 3) return 0;
+  auraDepth++;
+  try {
+    const owner = ownerOf(fc.uid);
+    let sum = 0;
+    for (const src of fieldCards(g, owner)) if (!isNegated(src)) sum += pick(D(src.id), src);
+    for (const src of fieldCards(g, opp(owner))) {
+      const d = D(src.id);
+      if (d.auraFoe && !isNegated(src)) sum += pick(d, src);
+    }
+    return sum;
+  } finally {
+    auraDepth--;
+  }
+}
+
 export function powerOf(g: Game, fc: FieldCard): number {
-  const owner = ownerOf(fc.uid);
   let p = D(fc.id).power;
-  if (g.active === owner) p += fc.don * 1000;
+  for (const m of fc.mods) if (m.stat === 'base') p = m.amount;
+  if (g.active === ownerOf(fc.uid)) p += fc.don * 1000;
   for (const m of fc.mods) if (m.stat === 'power') p += m.amount;
-  for (const src of unitsOf(g, owner)) {
-    const aura = D(src.id).powerAura;
-    if (aura) p += aura(g, src, fc);
-  }
-  const stage = P(g, owner).stage;
-  if (stage) {
-    const aura = D(stage.id).powerAura;
-    if (aura) p += aura(g, stage, fc);
-  }
-  return p;
+  return p + auraSum(g, fc, (d, src) => (d.powerAura ? d.powerAura(g, src, fc) : 0));
 }
 
 /** Itemised power for the UI ("6000 base +2000 DON!! +1000 effects"). */
@@ -133,19 +159,39 @@ export function powerBreakdown(g: Game, fc: FieldCard): { base: number; don: num
   return { base, don, effects: total - base - don, total };
 }
 
-export function costOf(g: Game, fc: FieldCard): number {
-  const d = D(fc.id);
-  let c = d.cost + (d.costAura ? d.costAura(g, fc) : 0);
-  for (const m of fc.mods) if (m.stat === 'cost') c += m.amount;
+/** What it costs `pid` to play the card `uid` from hand right now. */
+export function playCost(g: Game, pid: PlayerId, uid: number): number {
+  const d = defOf(g, uid);
+  let c = d.cost;
+  if (d.handCost) c += d.handCost(g, pid);
+  for (const fc of fieldCards(g, pid)) {
+    const sd = D(fc.id);
+    if (sd.handAura && !isNegated(fc)) c += sd.handAura(g, fc, uid);
+  }
   return Math.max(0, c);
 }
 
-export const hasFlag = (fc: FieldCard, flag: Flag): boolean => fc.flags.some((f) => f.flag === flag);
-
-export function hasKw(g: Game, fc: FieldCard, kw: Keyword): boolean {
-  const d = D(fc.id);
-  return !!d.keywords?.includes(kw) || hasFlag(fc, kw) || !!d.dynKeyword?.(g, fc, kw);
+/** Damage from a card effect (not from a battle). */
+export function dealDamage(g: Game, pid: PlayerId, n: number): void {
+  g.frames.push({ key: 'sys#damage', step: 0, ctx: mkCtx(pid, 0, '', { n, banish: 0, card: 0, dealt: 0, atk: 0 }) });
 }
+
+export function costOf(g: Game, fc: FieldCard): number {
+  let c = D(fc.id).cost;
+  for (const m of fc.mods) if (m.stat === 'cost') c += m.amount;
+  c += auraSum(g, fc, (d, src) => (d.costAura ? d.costAura(g, src, fc) : 0));
+  return Math.max(0, c);
+}
+
+/** Does this card currently have a keyword or state, from its own text, a temporary effect or another card? */
+export function hasState(g: Game, fc: FieldCard, flag: Flag): boolean {
+  if (hasFlag(fc, flag)) return true;
+  const d = D(fc.id);
+  if (!isNegated(fc) && ((d.keywords as Flag[] | undefined)?.includes(flag) || d.dynKeyword?.(g, fc, flag as Keyword))) return true;
+  return auraSum(g, fc, (sd, src) => (sd.flagAura?.(g, src, fc, flag) ? 1 : 0)) > 0;
+}
+
+export const hasKw = (g: Game, fc: FieldCard, kw: Keyword): boolean => hasState(g, fc, kw);
 
 export const totalDon = (p: PlayerState): number =>
   p.donActive + p.donRested + p.leader.don + p.chars.reduce((n, c) => n + c.don, 0);
@@ -169,6 +215,34 @@ export function addFlag(fc: FieldCard, flag: Flag, until: Until): void {
   fc.flags.push({ flag, until });
 }
 
+/** The turn number through which an effect used by `player` lasts (undefined = this turn / this battle only). */
+export function expiry(g: Game, player: PlayerId, span: Span): number | undefined {
+  const mine = g.active === player;
+  if (span === 'oppTurn') return g.turn + (mine ? 1 : 2);
+  // "Your opponent's next End Phase" read literally: on their own turn, that is the End Phase of this turn.
+  if (span === 'oppEnd') return mine ? g.turn + 1 : undefined;
+  if (span === 'myStart') return mine ? g.turn + 1 : undefined;
+  if (span === 'myTurn') return g.turn + (mine ? 2 : 1);
+  return undefined;
+}
+export function addModFor(g: Game, player: PlayerId, fc: FieldCard, stat: 'power' | 'cost' | 'base', amount: number, span: Span): void {
+  fc.mods.push({ stat, amount, until: span === 'battle' ? 'battle' : 'turn', exp: expiry(g, player, span) });
+}
+export function addFlagFor(g: Game, player: PlayerId, fc: FieldCard, flag: Flag, span: Span): void {
+  fc.flags.push({ flag, until: span === 'battle' ? 'battle' : 'turn', exp: expiry(g, player, span) });
+}
+
+export const rulesOf = (p: PlayerState): PlayerRule[] => p.rules ?? (p.rules = []);
+/** May this player put that Character into play right now? ("You cannot play Character cards during this turn.") */
+export const canPlayChar = (g: Game, pid: PlayerId, d: CardDef): boolean => !(P(g, pid).rules ?? []).some((r) => r.kind === 'noPlayChar' && d.cost >= r.n);
+
+/** Rests a card and lets "when this Character becomes rested" effects know. */
+export function restCard(g: Game, fc: FieldCard, by: PlayerId, how: string): void {
+  if (fc.rested) return;
+  fc.rested = true;
+  emit(g, { type: 'rested', player: ownerOf(fc.uid), uid: fc.uid, n: 1, by, how, other: 0 });
+}
+
 export function draw(g: Game, pid: PlayerId, n: number): number {
   const p = P(g, pid);
   let drawn = 0;
@@ -189,32 +263,37 @@ export function restDon(g: Game, pid: PlayerId, n: number): void {
 }
 
 /** DON!! −N: rested DON!! go back first, then active, then DON!! attached to cards. */
-export function returnDon(g: Game, pid: PlayerId, n: number): void {
+export function returnDon(g: Game, pid: PlayerId, n: number, by: PlayerId = pid, activeOnly = false): void {
   const p = P(g, pid);
-  let left = n;
+  let left = activeOnly ? Math.min(n, p.donActive) : n;
+  n = left;
   const take = (have: number): number => {
     const k = Math.min(have, left);
     left -= k;
     return k;
   };
-  p.donRested -= take(p.donRested);
+  if (!activeOnly) p.donRested -= take(p.donRested);
   p.donActive -= take(p.donActive);
   for (const fc of [...p.chars, p.leader]) fc.don -= take(fc.don);
   p.donDeck += n - left;
+  if (n - left > 0) emit(g, { type: 'donReturned', player: pid, uid: 0, n: n - left, by, how: '', other: 0 });
 }
 
 export function trashFromHand(g: Game, pid: PlayerId, uids: number[]): void {
   const p = P(g, pid);
+  let n = 0;
   for (const u of uids) {
     const i = p.hand.indexOf(u);
     if (i < 0) continue;
     p.hand.splice(i, 1);
     p.trash.push(u);
+    n++;
     log(g, pid, `${sv(g, pid, 'trash')} ${nameOf(g, u)} from hand.`);
   }
+  if (n) emit(g, { type: 'handTrashed', player: pid, uid: 0, n, by: pid, how: '', other: 0 });
 }
 
-type Dest = 'trash' | 'hand' | 'deckBottom' | 'lifeTop';
+type Dest = 'trash' | 'hand' | 'deckBottom' | 'deckTop' | 'lifeTop' | 'lifeBottom';
 
 /** Removes a Character or Stage from the field. Attached DON!! return to the cost area rested. */
 export function leaveField(g: Game, uid: number, dest: Dest): boolean {
@@ -231,65 +310,117 @@ export function leaveField(g: Game, uid: number, dest: Dest): boolean {
   if (dest === 'trash') p.trash.push(uid);
   else if (dest === 'hand') p.hand.push(uid);
   else if (dest === 'deckBottom') p.deck.push(uid);
+  else if (dest === 'deckTop') p.deck.unshift(uid);
+  else if (dest === 'lifeBottom') p.life.push({ uid, faceUp: true });
   else p.life.unshift({ uid, faceUp: true });
   return true;
 }
 
-export function koCard(g: Game, uid: number, cause: 'battle' | 'effect'): boolean {
+function koImmune(g: Game, fc: FieldCard, cause: 'battle' | 'effect'): boolean {
+  if (P(g, ownerOf(fc.uid)).noKO || hasState(g, fc, 'NoKO')) return true;
+  if (cause === 'battle') return hasState(g, fc, 'NoKOBattle');
+  return (!!D(fc.id).cantBeKoByEffect && !isNegated(fc)) || hasState(g, fc, 'NoKOEffect');
+}
+
+export function koCard(g: Game, uid: number, cause: 'battle' | 'effect', by: PlayerId = opp(ownerOf(uid))): boolean {
   const fc = findField(g, uid);
   if (!fc || isLeader(g, uid)) return false;
   const owner = ownerOf(uid);
   const d = D(fc.id);
-  if (P(g, owner).noKO || hasFlag(fc, 'NoKO') || (cause === 'effect' && d.cantBeKoByEffect)) {
+  if (koImmune(g, fc, cause)) {
     log(g, null, `${d.name} cannot be K.O.'d.`);
     return false;
   }
+  const attacker = cause === 'battle' && g.battle ? g.battle.attacker : 0;
   leaveField(g, uid, 'trash');
   g.stats[opp(owner)].kos++;
   log(g, owner, `${own(g, owner)} ${d.name} is K.O.'d.`, 'ko');
   trigger(g, 'onKO', uid, fc);
+  emit(g, { type: 'ko', player: owner, uid, n: 1, by, how: cause, other: attacker }, [fc]);
+  if (cause === 'effect') emit(g, { type: 'removed', player: owner, uid, n: 1, by, how: 'ko', other: 0 }, [fc]);
   return true;
 }
 
-export type RemoveMode = 'ko' | 'hand' | 'bottom' | 'trash';
-const MODES: RemoveMode[] = ['ko', 'hand', 'bottom', 'trash'];
+export type RemoveMode = 'ko' | 'hand' | 'bottom' | 'top' | 'trash' | 'life' | 'lifeBottom';
+const MODES: RemoveMode[] = ['ko', 'hand', 'bottom', 'top', 'trash', 'life', 'lifeBottom'];
+const DESTS: Record<Exclude<RemoveMode, 'ko'>, [Dest, string]> = {
+  hand: ['hand', "returned to its owner's hand"],
+  bottom: ['deckBottom', "placed at the bottom of its owner's deck"],
+  top: ['deckTop', "placed on top of its owner's deck"],
+  trash: ['trash', 'trashed'],
+  life: ['lifeTop', "added to the top of its owner's Life cards face-up"],
+  lifeBottom: ['lifeBottom', "added to the bottom of its owner's Life cards face-up"],
+};
 
-function doRemove(g: Game, uid: number, mode: RemoveMode): void {
+function doRemove(g: Game, uid: number, mode: RemoveMode, battle = false, by: PlayerId = opp(ownerOf(uid))): void {
   const owner = ownerOf(uid);
-  const name = findField(g, uid) ? nameOf(g, uid) : '';
-  if (mode === 'ko') koCard(g, uid, 'effect');
-  else if (leaveField(g, uid, mode === 'hand' ? 'hand' : mode === 'bottom' ? 'deckBottom' : 'trash')) {
-    const where = mode === 'hand' ? "returned to its owner's hand" : mode === 'bottom' ? "placed at the bottom of its owner's deck" : 'trashed';
+  const fc = findField(g, uid);
+  if (!fc) return;
+  if (mode === 'ko') {
+    koCard(g, uid, battle ? 'battle' : 'effect', by);
+    return;
+  }
+  const name = nameOf(g, uid);
+  const [dest, where] = DESTS[mode];
+  if (leaveField(g, uid, dest)) {
     log(g, owner, `${own(g, owner)} ${name} is ${where}.`, 'effect');
+    emit(g, { type: 'removed', player: owner, uid, n: 1, by, how: mode, other: 0 }, [fc]);
   }
 }
 
-/** Removal by a card effect. Gives the owner the chance to use a replacement effect first. */
-export function removeByEffect(g: Game, by: PlayerId, uid: number, mode: RemoveMode): void {
+const replaceDefs = (d: CardDef): ReplaceDef[] => [...(d.replaceRemoval ? [d.replaceRemoval] : []), ...(d.replaces ?? [])];
+
+/** The "instead" effect of `r` that could save `victim` right now, if it has one. */
+function replacementOf(g: Game, r: FieldCard, victim: FieldCard, cause: RemovalCause): { def: ReplaceDef; key: string } | null {
+  if (isNegated(r)) return null;
+  const d = D(r.id);
+  const all = replaceDefs(d);
+  for (let i = 0; i < all.length; i++) {
+    const def = all[i];
+    const key = `${d.id}#r${i}`;
+    if (def.opt && r.used.includes(key)) continue;
+    // Hand-written replacements only ever protected OTHER Characters from an opponent's effect.
+    if (!def.steps && (!cause.byOpp || cause.battle || r.uid === victim.uid || D(victim.id).category !== 'Character')) continue;
+    if (def.can(g, r, victim, cause)) return { def, key };
+  }
+  return null;
+}
+
+/** Takes a Character or Stage off the field, first giving its owner the chance to use an "instead" effect. */
+export function removeCard(g: Game, by: PlayerId, uid: number, mode: RemoveMode, battle: boolean): void {
   const fc = findField(g, uid);
   if (!fc || isLeader(g, uid)) return;
   const owner = ownerOf(uid);
   const d = D(fc.id);
-  if (mode === 'ko' && (d.cantBeKoByEffect || P(g, owner).noKO || hasFlag(fc, 'NoKO'))) {
-    log(g, null, `${d.name} cannot be K.O.'d by this effect.`);
+  if (mode === 'ko' && koImmune(g, fc, battle ? 'battle' : 'effect')) {
+    log(g, null, `${d.name} cannot be K.O.'d${battle ? ' in battle' : ' by this effect'}.`);
     return;
   }
-  if (by !== owner && d.category === 'Character') {
-    const reps = P(g, owner).chars.filter((r) => r.uid !== uid && D(r.id).replaceRemoval?.can(g, r, fc));
-    if (reps.length) {
-      const c = mkCtx(owner, uid, fc.id, { mode: MODES.indexOf(mode) });
-      c.list = reps.map((r) => r.uid);
-      g.frames.push({ key: 'sys#replace', step: 0, ctx: c });
-      return;
-    }
+  if (!battle && by !== owner && hasState(g, fc, 'NoRemove')) {
+    log(g, null, `${d.name} cannot be removed from the field by an opponent's effect.`);
+    return;
   }
-  doRemove(g, uid, mode);
+  const cause: RemovalCause = { mode, battle, byOpp: by !== owner };
+  const reps = fieldCards(g, owner).filter((r) => replacementOf(g, r, fc, cause));
+  if (reps.length) {
+    const c = mkCtx(owner, uid, fc.id, { mode: MODES.indexOf(mode), battle: battle ? 1 : 0, by });
+    c.list = reps.map((r) => r.uid);
+    g.frames.push({ key: 'sys#replace', step: 0, ctx: c });
+    return;
+  }
+  doRemove(g, uid, mode, battle, by);
+}
+
+/** Removal by a card effect. */
+export function removeByEffect(g: Game, by: PlayerId, uid: number, mode: RemoveMode): void {
+  removeCard(g, by, uid, mode, false);
 }
 
 /** Puts a Character into play. The card must already be out of its previous zone. */
-export function playCharacter(g: Game, pid: PlayerId, uid: number, rested: boolean): void {
+const ZONES = ['hand', 'trash', 'deck', 'life'];
+export function playCharacter(g: Game, pid: PlayerId, uid: number, rested: boolean, from = 'hand'): void {
   if (!g.limbo.includes(uid)) g.limbo.push(uid);
-  g.frames.push({ key: 'sys#play', step: 0, ctx: mkCtx(pid, uid, g.ids[uid], { rested: rested ? 1 : 0 }) });
+  g.frames.push({ key: 'sys#play', step: 0, ctx: mkCtx(pid, uid, g.ids[uid], { rested: rested ? 1 : 0, from: Math.max(0, ZONES.indexOf(from)) }) });
 }
 
 export function placeStage(g: Game, pid: PlayerId, uid: number): void {
@@ -328,7 +459,11 @@ export function canPay(g: Game, pid: PlayerId, src: number, k: CostSpec): boolea
   if (k.donMinus && totalDon(p) < k.donMinus) return false;
   if (k.restSelf) {
     const fc = findField(g, src);
-    if (!fc || fc.rested) return false;
+    if (!fc || fc.rested || hasState(g, fc, 'CantRest')) return false;
+  }
+  if (k.extra) {
+    const c = mkCtx(pid, src, g.ids[src] ?? '');
+    if (k.extra.some((x) => !x.can(g, c))) return false;
   }
   if (k.trashHand) {
     const n = p.hand.filter((u) => u !== src && (!k.trashFilter || k.trashFilter(defOf(g, u)))).length;
@@ -338,7 +473,7 @@ export function canPay(g: Game, pid: PlayerId, src: number, k: CostSpec): boolea
     const n = p.hand.filter((u) => !k.revealFilter || k.revealFilter(defOf(g, u))).length;
     if (n < k.reveal) return false;
   }
-  if (k.lifeToHand && p.life.length === 0) return false;
+  if (k.lifeToHand && (p.life.length === 0 || rulesOf(p).some((r) => r.kind === 'noLifeToHand'))) return false;
   return true;
 }
 
@@ -351,6 +486,7 @@ export function costText(k: CostSpec): string {
   if (k.trashHand) parts.push(`trash ${k.trashHand} ${k.trashDesc ?? 'card'}${k.trashDesc ? '' : k.trashHand > 1 ? 's' : ''} from your hand`);
   if (k.reveal) parts.push(`reveal ${k.reveal} matching cards from your hand`);
   if (k.lifeToHand) parts.push('add 1 Life card to your hand');
+  for (const x of k.extra ?? []) parts.push(x.text);
   return parts.join(', ');
 }
 
@@ -361,13 +497,14 @@ function buildSteps(d: CardDef, e: EffectDef, key: string): Step[] {
   // Effects the player explicitly chose to use don't need a second "are you sure?".
   const chosen = e.timing === 'activateMain' || e.timing === 'main' || e.timing === 'counter' || e.timing === 'trigger';
   const markUsed = (g: Game, c: Ctx): void => {
-    if (!e.opt) return;
     const fc = findField(g, c.src);
     if (fc && !fc.used.includes(key)) fc.used.push(key);
   };
   const s: Step[] = [];
   s.push((g, c) => {
-    if (needsField && !findField(g, c.src)) return 'stop';
+    const here = findField(g, c.src);
+    if (needsField && !here) return 'stop';
+    if (e.opt && here?.used.includes(key)) return 'stop';
     if (e.when && !e.when(g, c)) return 'stop';
     if (!e.cost) {
       markUsed(g, c);
@@ -390,7 +527,7 @@ function buildSteps(d: CardDef, e: EffectDef, key: string): Step[] {
       }
       if (k.restSelf) {
         const fc = findField(g, c.src);
-        if (fc) fc.rested = true;
+        if (fc) restCard(g, fc, c.player, 'cost');
       }
       if (k.reveal) {
         const shown = p.hand.filter((u) => !k.revealFilter || k.revealFilter(defOf(g, u))).slice(0, k.reveal);
@@ -430,6 +567,7 @@ function buildSteps(d: CardDef, e: EffectDef, key: string): Step[] {
       });
       s.push((g, c) => trashFromHand(g, c.player, c.sel));
     }
+    for (const part of k.extra ?? []) s.push(...part.steps);
   }
   s.push(...e.steps);
   return s;
@@ -442,6 +580,9 @@ export function registerCards(defs: CardDef[]): void {
       const key = effectKey(d.id, i);
       STEPS[key] = buildSteps(d, e, key);
     });
+    replaceDefs(d).forEach((r, i) => {
+      if (r.steps) STEPS[`${d.id}#r${i}`] = r.steps;
+    });
   }
 }
 
@@ -452,6 +593,7 @@ export function trigger(g: Game, timing: Timing, uid: number, was?: FieldCard): 
   if (!d.effects) return;
   // `was` is the card as it stood on the field, for effects that fire as it leaves ([On K.O.]).
   const fc = findField(g, uid) ?? was ?? null;
+  if (fc && isNegated(fc)) return;
   const owner = ownerOf(uid);
   d.effects.forEach((e, i) => {
     if (e.timing !== timing) return;
@@ -462,6 +604,29 @@ export function trigger(g: Game, timing: Timing, uid: number, was?: FieldCard): 
     if (e.when && !e.when(g, c)) return;
     g.queue.push({ key, step: 0, ctx: c });
   });
+}
+
+/** Tells every card on the field that something happened, queuing the "When ..." effects that react to it. */
+export function emit(g: Game, ev: GameEvent, gone: FieldCard[] = []): void {
+  if (g.winner !== null || g.phase === 'setup') return;
+  for (const pid of [g.active, opp(g.active)]) {
+    for (const fc of [...fieldCards(g, pid), ...gone.filter((x) => ownerOf(x.uid) === pid)]) {
+      const d = D(fc.id);
+      if (!d.effects || isNegated(fc)) continue;
+      d.effects.forEach((e, i) => {
+        if (e.timing !== 'event' || e.event !== ev.type) return;
+        const key = effectKey(d.id, i);
+        if (e.don && fc.don < e.don) return;
+        if (e.opt && fc.used.includes(key)) return;
+        if (e.match && !e.match(g, fc, ev)) return;
+        const c = mkCtx(pid, fc.uid, d.id, { evUid: ev.uid, evN: ev.n, evOther: ev.other, that: ev.uid });
+        if (e.when && !e.when(g, c)) return;
+        // The same [Once Per Turn] reaction must not be queued twice before it resolves.
+        if (e.opt && g.queue.some((f) => f.key === key && f.ctx.src === fc.uid)) return;
+        g.queue.push({ key, step: 0, ctx: c });
+      });
+    }
+  }
 }
 
 // ---------------------------------------------------------------- system routines
@@ -496,22 +661,28 @@ STEPS['sys#play'] = [
     p.chars.push(fc);
     log(g, c.player, `${sv(g, c.player, 'play')} ${D(c.cardId).name}${fc.rested ? ' (rested)' : ''}.`, 'play');
     trigger(g, 'onPlay', c.src);
+    emit(g, { type: 'playChar', player: c.player, uid: c.src, n: 1, by: c.player, how: ZONES[c.v.from ?? 0], other: 0 });
   },
 ];
 
+const causeOf = (c: Ctx): RemovalCause => ({ mode: MODES[c.v.mode], battle: c.v.battle === 1, byOpp: c.v.by !== c.player });
+
+// ctx.src = the card about to leave the field; ctx.list = cards whose "instead" effect could save it.
 STEPS['sys#replace'] = [
   (g, c) => {
+    const v = findField(g, c.src);
+    c.sel = [];
+    if (!v) return 'stop';
+    const cause = causeOf(c);
     const opts = c.list.filter((u) => {
       const r = findField(g, u);
-      const v = findField(g, c.src);
-      return !!r && !!v && !!D(r.id).replaceRemoval?.can(g, r, v);
+      return !!r && !!replacementOf(g, r, v, cause);
     });
-    c.sel = [];
-    if (!findField(g, c.src) || !opts.length) return;
+    if (!opts.length) return;
     return {
       kind: 'select',
       player: c.player,
-      prompt: `Your opponent's effect would remove ${D(c.cardId).name}. Use one of these cards to protect it instead?`,
+      prompt: `${D(c.cardId).name} is about to be ${cause.mode === 'ko' ? "K.O.'d" : 'removed'}. Use one of these cards to protect it instead?`,
       options: opts,
       min: 0,
       max: 1,
@@ -520,12 +691,17 @@ STEPS['sys#replace'] = [
     };
   },
   (g, c) => {
+    const v = findField(g, c.src);
+    if (!v) return;
+    const cause = causeOf(c);
     const rep = c.sel.length ? findField(g, c.sel[0]) : null;
-    if (rep) {
-      const rd = D(rep.id);
-      log(g, c.player, `${rd.name} protects ${D(c.cardId).name}: ${rd.replaceRemoval!.text}`, 'effect');
-      rd.replaceRemoval!.apply(g, rep);
-    } else doRemove(g, c.src, MODES[c.v.mode]);
+    const found = rep ? replacementOf(g, rep, v, cause) : null;
+    if (rep && found) {
+      log(g, c.player, `${D(rep.id).name} protects ${D(c.cardId).name}: ${found.def.text}`, 'effect');
+      if (found.def.opt) rep.used.push(found.key);
+      if (found.def.steps) g.frames.push({ key: found.key, step: 0, ctx: mkCtx(c.player, rep.uid, rep.id, { victim: c.src, that: c.src }) });
+      else found.def.apply?.(g, rep);
+    } else doRemove(g, c.src, MODES[c.v.mode], c.v.battle === 1, c.v.by as PlayerId);
   },
 ];
 
@@ -559,6 +735,8 @@ STEPS['sys#damage'] = [
     c.v.n--;
     c.v.dealt = 1;
     c.v.card = lc.uid;
+    emit(g, { type: 'lifeLost', player: c.player, uid: lc.uid, n: 1, by: opp(c.player), how: 'damage', other: 0 });
+    emit(g, { type: 'damage', player: c.player, uid: c.v.atk ?? 0, n: 1, by: opp(c.player), how: '', other: 0 });
     if (c.v.banish) {
       p.trash.push(lc.uid);
       log(g, c.player, `${sv(g, c.player, 'take')} 1 damage — [Banish] trashes the Life card ${nameOf(g, lc.uid)} (${p.life.length} Life left).`, 'damage');
@@ -572,6 +750,7 @@ STEPS['sys#damage'] = [
       return { kind: 'trigger', player: c.player, uid: lc.uid };
     }
     p.hand.push(lc.uid);
+    emit(g, { type: 'lifeToHand', player: c.player, uid: lc.uid, n: 1, by: c.player, how: '', other: 0 });
     c.jump = 0;
   },
   (g, c) => {
@@ -582,10 +761,12 @@ STEPS['sys#damage'] = [
       const id = g.ids[uid];
       log(g, c.player, `${sv(g, c.player, 'reveal')} ${D(id).name} and ${vb(g, c.player, 'activate')} its [Trigger]!`, 'effect');
       g.frames.push({ key: effectKey(id, ti), step: 0, ctx: mkCtx(c.player, uid, id) });
+      emit(g, { type: 'trigger', player: c.player, uid, n: 1, by: c.player, how: '', other: 0 });
     } else {
       const li = g.limbo.indexOf(uid);
       if (li >= 0) g.limbo.splice(li, 1);
       p.hand.push(uid);
+      emit(g, { type: 'lifeToHand', player: c.player, uid, n: 1, by: c.player, how: '', other: 0 });
     }
     c.jump = 0;
   },
@@ -677,15 +858,14 @@ function startTurn(g: Game): void {
   for (const fc of unitsOf(g, g.active)) {
     p.donRested += fc.don;
     fc.don = 0;
-    fc.used = [];
   }
+  // [Once Per Turn] means once in each turn, whoever's turn it is.
+  for (const pid of [0, 1] as PlayerId[]) for (const fc of fieldCards(g, pid)) fc.used = [];
   p.donActive += p.donRested;
   p.donRested = 0;
-  p.leader.rested = false;
-  if (p.stage) {
-    p.stage.rested = false;
-    p.stage.used = [];
-  }
+  if (p.leader.frozen) p.leader.frozen = false;
+  else p.leader.rested = false;
+  if (p.stage) p.stage.rested = false;
   for (const fc of p.chars) {
     if (fc.frozen) {
       fc.frozen = false;
@@ -705,10 +885,13 @@ function finishTurn(g: Game): void {
   for (const pid of [0, 1] as PlayerId[]) {
     const q = P(g, pid);
     q.noKO = false;
-    for (const fc of [...unitsOf(g, pid), ...(q.stage ? [q.stage] : [])]) {
-      fc.mods = [];
-      fc.flags = [];
+    // Effects that last "until the end of your opponent's next turn" carry a turn number and outlive this turn.
+    const lasts = (x: { exp?: number }): boolean => x.exp !== undefined && x.exp > g.turn;
+    for (const fc of fieldCards(g, pid)) {
+      fc.mods = fc.mods.filter(lasts);
+      fc.flags = fc.flags.filter(lasts);
     }
+    if (q.rules) q.rules = q.rules.filter(lasts);
   }
   g.active = opp(g.active);
   startTurn(g);
@@ -727,7 +910,7 @@ export function whyCantPlay(g: Game, uid: number): string | null {
   if (g.winner !== null) return 'The game is over.';
   if (g.active !== pid || g.phase !== 'main' || busy(g)) return 'You can only play cards during your own Main Phase.';
   if (!p.hand.includes(uid)) return 'That card is not in your hand.';
-  if (d.sim === 'none') return 'The simulator cannot run this card’s effect yet.';
+  if (d.sim === 'none') return 'The simulator does not model this card’s effect yet.';
   if (d.category === 'Event') {
     const i = mainEffectIndex(d);
     if (i < 0) {
@@ -740,7 +923,9 @@ export function whyCantPlay(g: Game, uid: number): string | null {
     if (e.cost && !canPay(g, pid, uid, e.cost)) return 'You cannot pay its additional cost.';
   }
   if (d.category === 'Leader') return 'Leaders are never played from hand.';
-  if (p.donActive < d.cost) return `It costs ${d.cost} DON!! and you only have ${p.donActive} active.`;
+  if (d.category === 'Character' && !canPlayChar(g, pid, d)) return 'An effect stops you from playing that Character this turn.';
+  const price = playCost(g, pid, uid);
+  if (p.donActive < price) return `It costs ${price} DON!! and you only have ${p.donActive} active.`;
   return null;
 }
 
@@ -751,7 +936,9 @@ export function whyCantAttack(g: Game, uid: number): string | null {
   if (g.winner !== null) return 'The game is over.';
   if (!fc || g.active !== pid || g.phase !== 'main' || busy(g)) return 'You can only attack during your own Main Phase.';
   if (p.stage?.uid === uid) return 'Stages cannot attack.';
-  if (D(fc.id).cantAttack) return 'This card cannot attack (it says so on the card).';
+  if (D(fc.id).cantAttack && !isNegated(fc)) return 'This card cannot attack (it says so on the card).';
+  if (hasState(g, fc, 'CantAttack')) return 'An effect stops this card from attacking right now.';
+  if (hasState(g, fc, 'CantRest')) return 'This card cannot be rested right now, so it cannot attack.';
   if (p.turns <= 1) return 'Neither player can attack on their first turn.';
   if (fc.rested) return 'A rested card cannot attack.';
   if (summoningSick(g, fc) && !hasKw(g, fc, 'Rush: Character')) {
@@ -769,7 +956,9 @@ function summoningSick(g: Game, fc: FieldCard): boolean {
 export function attackTargets(g: Game, uid: number): number[] {
   const o = P(g, opp(ownerOf(uid)));
   const fc = findField(g, uid);
-  const rested = o.chars.filter((c) => c.rested).map((c) => c.uid);
+  // Some cards "can also attack your opponent's active Characters".
+  const anyState = !!fc && hasState(g, fc, 'AttackActive');
+  const rested = o.chars.filter((c) => anyState || c.rested).map((c) => c.uid);
   // [Rush: Character] lets a freshly played Character attack Characters only.
   if (fc && summoningSick(g, fc)) return rested;
   return [o.leader.uid, ...rested];
@@ -793,6 +982,7 @@ export function whyCantActivate(g: Game, uid: number, idx: number): string | nul
   const e = d.effects?.[idx];
   if (!e || e.timing !== 'activateMain') return 'Not an [Activate: Main] effect.';
   if (e.don && fc.don < e.don) return `Needs ${e.don} DON!! attached to this card ([DON!! x${e.don}]).`;
+  if (isNegated(fc)) return 'This card’s effects are negated right now.';
   if (e.opt && fc.used.includes(effectKey(d.id, idx))) return 'Already used this turn ([Once Per Turn]).';
   if (e.cost && !canPay(g, pid, uid, e.cost)) return `You cannot pay the cost (${costText(e.cost)}).`;
   if (e.when && !e.when(g, mkCtx(pid, uid, d.id))) return 'Its condition is not met right now.';
@@ -807,7 +997,7 @@ export function counterOptions(g: Game, pid: PlayerId): number[] {
     if (d.category === 'Character') return d.counter > 0;
     if (d.category !== 'Event' || d.sim === 'none') return false;
     const e = d.effects?.find((x) => x.timing === 'counter');
-    if (!e || p.donActive < d.cost) return false;
+    if (!e || p.donActive < playCost(g, pid, u)) return false;
     if (e.cost && !canPay(g, pid, u, e.cost)) return false;
     return !e.when || e.when(g, mkCtx(pid, u, d.id));
   });
@@ -819,7 +1009,8 @@ export function blockersFor(g: Game): number[] {
   const a = findField(g, b.attacker);
   if (!a || b.noBlock || hasKw(g, a, 'Unblockable')) return [];
   return P(g, opp(ownerOf(b.attacker)))
-    .chars.filter((c) => !c.rested && c.uid !== b.target && hasKw(g, c, 'Blocker') && !(b.noBlockMin > 0 && powerOf(g, c) >= b.noBlockMin))
+    .chars.filter((c) => !c.rested && c.uid !== b.target && hasKw(g, c, 'Blocker') && !hasState(g, c, 'CantBlock') && !hasState(g, c, 'CantRest'))
+    .filter((c) => !(b.noBlockMin > 0 && powerOf(g, c) >= b.noBlockMin) && !(b.noBlockMax !== undefined && powerOf(g, c) <= b.noBlockMax) && !(b.noBlockCostMax !== undefined && costOf(g, c) <= b.noBlockCostMax))
     .map((c) => c.uid);
 }
 
@@ -851,8 +1042,9 @@ function doPlay(g: Game, uid: number): void {
   const pid = g.active;
   const p = P(g, pid);
   const d = defOf(g, uid);
-  restDon(g, pid, d.cost);
-  g.stats[pid].donSpent += d.cost;
+  const price = playCost(g, pid, uid);
+  restDon(g, pid, price);
+  g.stats[pid].donSpent += price;
   g.stats[pid].cardsPlayed++;
   p.hand.splice(p.hand.indexOf(uid), 1);
   if (d.category === 'Character') playCharacter(g, pid, uid, false);
@@ -861,6 +1053,7 @@ function doPlay(g: Game, uid: number): void {
     g.limbo.push(uid);
     log(g, pid, `${sv(g, pid, 'play')} the Event ${d.name}.`, 'play');
     g.frames.push({ key: effectKey(d.id, mainEffectIndex(d)), step: 0, ctx: mkCtx(pid, uid, d.id) });
+    emit(g, { type: 'useEvent', player: pid, uid, n: 1, by: pid, how: 'main', other: 0 });
   }
 }
 
@@ -871,13 +1064,13 @@ function doAttack(g: Game, attacker: number, target: number): void {
   const pid = g.active;
   const a = findField(g, attacker)!;
   const t = findField(g, target)!;
-  a.rested = true;
   g.stats[pid].attacks++;
   g.battle = { attacker, target, step: 'declared', noBlock: false, noBlockMin: 0, blocked: false, counterAdded: 0 };
   log(g, pid, `${own(g, pid)} ${D(a.id).name} (${powerOf(g, a)}) attacks ${own(g, opp(pid), false)} ${D(t.id).name} (${powerOf(g, t)}).`, 'attack');
   trigger(g, 'whenAttacking', attacker);
-  const dp = P(g, opp(pid));
-  for (const fc of [...unitsOf(g, opp(pid)), ...(dp.stage ? [dp.stage] : [])]) trigger(g, 'onOppAttack', fc.uid);
+  for (const fc of fieldCards(g, opp(pid))) trigger(g, 'onOppAttack', fc.uid);
+  restCard(g, a, pid, 'attack');
+  emit(g, { type: 'attack', player: pid, uid: attacker, n: 1, by: pid, how: '', other: target });
 }
 
 function doEnd(g: Game): void {
@@ -888,7 +1081,29 @@ function doEnd(g: Game): void {
   // "Idle" means it had a real attack available: Blockers held back and attackers too small to reach anything do not count.
   if (p.turns > 1) g.stats[pid].readyNoAttack += unitsOf(g, pid).filter((fc) => !whyCantAttack(g, fc.uid) && !hasKw(g, fc, 'Blocker') && canReachTarget(g, fc)).length;
   g.phase = 'end';
-  for (const fc of [...unitsOf(g, pid), ...(p.stage ? [p.stage] : [])]) trigger(g, 'endOfTurn', fc.uid);
+  // Things an effect scheduled for "the end of this turn" (either player's effect may have).
+  for (const r of [...(p.rules ?? []), ...(P(g, opp(pid)).rules ?? []).filter((x) => x.kind === 'endGainLife' || x.kind === 'endActive')]) {
+    if (r.kind === 'endUntapDon') {
+      const k = Math.min(r.n, p.donRested);
+      p.donRested -= k;
+      p.donActive += k;
+      if (k) log(g, pid, `${sv(g, pid, 'set')} ${k} DON!! as active at the end of the turn.`, 'effect');
+    } else if (r.kind === 'endTrash' && findField(g, r.n)) {
+      const name = nameOf(g, r.n);
+      if (leaveField(g, r.n, 'trash')) log(g, pid, `${name} is trashed at the end of the turn.`, 'effect');
+    } else if (r.kind === 'endActive') {
+      const fc = findField(g, r.n);
+      if (fc?.rested) {
+        fc.rested = false;
+        log(g, pid, `${D(fc.id).name} is set as active at the end of the turn.`, 'effect');
+      }
+    } else if (r.kind === 'endGainLife') {
+      for (let i = 0; i < r.n && p.deck.length > 1; i++) p.life.unshift({ uid: p.deck.shift()!, faceUp: false });
+      log(g, pid, `${sv(g, pid, 'add')} ${r.n} card${r.n === 1 ? '' : 's'} from the deck to Life at the end of the turn (${p.life.length} Life).`, 'effect');
+    }
+  }
+  if (p.rules) p.rules = p.rules.filter((r) => r.kind === 'noPlayChar' || r.kind === 'noLifeToHand');
+  for (const fc of fieldCards(g, pid)) trigger(g, 'endOfTurn', fc.uid);
 }
 
 function useCounter(g: Game, pid: PlayerId, uid: number): void {
@@ -906,14 +1121,16 @@ function useCounter(g: Game, pid: PlayerId, uid: number): void {
     log(g, pid, `${sv(g, pid, 'counter')} with ${d.name}: +${d.counter} (target is now ${t ? powerOf(g, t) : 0}).`, 'effect');
   } else {
     const i = d.effects!.findIndex((e) => e.timing === 'counter');
-    restDon(g, pid, d.cost);
+    const price = playCost(g, pid, uid);
+    restDon(g, pid, price);
     // DON!! held back and then spent on a [Counter] Event was not wasted after all.
-    g.stats[pid].donUnused = Math.max(0, g.stats[pid].donUnused - d.cost);
+    g.stats[pid].donUnused = Math.max(0, g.stats[pid].donUnused - price);
     g.limbo.push(uid);
     b.counterAdded += d.effects![i].boost ?? 0;
     g.stats[pid].counterPower += d.effects![i].boost ?? 0;
     log(g, pid, `${sv(g, pid, 'play')} the [Counter] Event ${d.name}.`, 'effect');
     g.frames.push({ key: effectKey(d.id, i), step: 0, ctx: mkCtx(pid, uid, d.id) });
+    emit(g, { type: 'useEvent', player: pid, uid, n: 1, by: pid, how: 'counter', other: 0 });
   }
 }
 
@@ -959,11 +1176,12 @@ function answer(g: Game, ans: Answer): void {
     if (ans.kind === 'block') {
       if (ans.uid !== null) {
         const fc = findField(g, ans.uid)!;
-        fc.rested = true;
         b.target = ans.uid;
         b.blocked = true;
         log(g, defP, `${sv(g, defP, 'block')} with ${D(fc.id).name} (${powerOf(g, fc)}).`, 'attack');
         trigger(g, 'onBlock', ans.uid);
+        restCard(g, fc, defP, 'block');
+        emit(g, { type: 'useBlocker', player: defP, uid: ans.uid, n: 1, by: defP, how: '', other: 0 });
       }
     } else if (ans.kind === 'counter') {
       if (ans.use === null) b.step = 'damage';
@@ -1028,10 +1246,10 @@ function battleStep(g: Game): void {
       if (isLeader(g, b.target)) {
         const n = hasKw(g, a!, 'Double Attack') ? 2 : 1;
         log(g, atkP, `The attack hits: ${an} ${ap} vs ${tn} ${tp}.${n === 2 ? ' [Double Attack] deals 2 damage!' : ''}`, 'attack');
-        g.frames.push({ key: 'sys#damage', step: 0, ctx: mkCtx(defP, 0, '', { n, banish: hasKw(g, a!, 'Banish') ? 1 : 0, card: 0, dealt: 0 }) });
+        g.frames.push({ key: 'sys#damage', step: 0, ctx: mkCtx(defP, 0, '', { n, banish: hasKw(g, a!, 'Banish') ? 1 : 0, card: 0, dealt: 0, atk: b.attacker }) });
       } else {
         log(g, atkP, `The attack wins the battle: ${an} ${ap} vs ${tn} ${tp}.`, 'attack');
-        koCard(g, b.target, 'battle');
+        removeCard(g, atkP, b.target, 'ko', true);
       }
       return;
     }
@@ -1129,6 +1347,7 @@ export function apply(g: Game, a: Action): void {
       p.donActive -= a.n;
       fc.don += a.n;
       log(g, g.active, `${sv(g, g.active, 'give')} ${a.n} DON!! to ${D(fc.id).name} (now ${powerOf(g, fc)}).`);
+      emit(g, { type: 'donGiven', player: g.active, uid: fc.uid, n: a.n, by: g.active, how: '', other: 0 });
     } else if (a.type === 'attack') doAttack(g, a.attacker, a.target);
     else if (a.type === 'activate') {
       const why = whyCantActivate(g, a.uid, a.idx);

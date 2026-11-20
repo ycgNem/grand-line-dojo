@@ -26,7 +26,7 @@ describe('engine fuzzing (random legal play never breaks the rules)', () => {
 
   it('random decks built from every simulated card', () => {
     let finished = 0;
-    const N = 150;
+    const N = Number((globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.FUZZ_N ?? 150);
     for (let s = 0; s < N; s++) {
       const g = createGame({ decks: [randomDeck(s * 2 + 1), randomDeck(s * 2 + 2)], seed: 9000 + s });
       fuzzGame(g, 4242 + s);

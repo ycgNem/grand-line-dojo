@@ -6,6 +6,7 @@ import { SIM_LABEL, SIM_NOTE, insights, roles } from '../data/analysis';
 import { ALL_CARDS, card } from '../data/db';
 import type { CardDef } from '../engine/types';
 import { type Child, btn, cardEl, h, modal } from './dom';
+import { localPicture } from './localart';
 
 const EARLY_SETS = new Set(['OP01', 'OP02', 'OP03', 'OP04', 'ST01', 'ST02', 'ST03', 'ST04']);
 
@@ -46,6 +47,8 @@ export function cardInfo(d: CardDef, onOpen?: (id: string) => void): HTMLElement
       'div',
       { class: 'cinfo-card' },
       cardEl(d, { size: 'lg' }),
+      // Your own picture from the local-art/ folder, shown whole. It exists only on this computer.
+      localPicture(d.id) ? h('img', { class: 'localpic', src: localPicture(d.id), alt: `Your picture of ${d.name} (${d.id})`, loading: 'lazy' }) : null,
       // The picture above is this site's own drawing. The printed card's artwork belongs to its publisher, so we link to it instead of copying it.
       h('a', { class: 'printed', href: `https://onepiece.limitlesstcg.com/cards/${encodeURIComponent(d.id)}`, target: '_blank', rel: 'noopener noreferrer' }, 'See the printed card ↗'),
     ),

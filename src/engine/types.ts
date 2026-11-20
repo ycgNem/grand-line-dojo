@@ -7,8 +7,15 @@ export type Color = 'Red' | 'Green' | 'Blue' | 'Purple' | 'Black' | 'Yellow';
 export type Category = 'Leader' | 'Character' | 'Event' | 'Stage';
 export type Attribute = 'Strike' | 'Slash' | 'Special' | 'Ranged' | 'Wisdom';
 export type Keyword = 'Rush' | 'Blocker' | 'Double Attack' | 'Banish' | 'Unblockable' | 'Rush: Character';
-export type Flag = Keyword | 'NoKO';
+/** Temporary or continuous states a card on the field can be in. */
+export type Status = 'NoKO' | 'NoKOBattle' | 'NoKOEffect' | 'NoRemove' | 'CantAttack' | 'CantBlock' | 'CantRest' | 'Negated' | 'AttackActive';
+export type Flag = Keyword | Status;
 export type Until = 'battle' | 'turn';
+/**
+ * How long an effect lasts: this battle, this turn, through the opponent's next turn, until the opponent's next End Phase
+ * (the one of the current turn, when used on their turn), until your next turn starts, or through your next turn.
+ */
+export type Span = 'battle' | 'turn' | 'oppTurn' | 'oppEnd' | 'myStart' | 'myTurn';
 export type Timing =
   | 'onPlay'
   | 'whenAttacking'
@@ -20,16 +27,63 @@ export type Timing =
   | 'trigger'
   | 'endOfTurn'
   | 'onOppAttack'
-  | 'afterBattleChar';
+  | 'afterBattleChar'
+  /** "When <something happens>, ..." — see EffectDef.event. */
+  | 'event';
 
 export interface Mod {
-  stat: 'power' | 'cost';
+  /** 'base' replaces the printed power ("base power becomes N"). */
+  stat: 'power' | 'cost' | 'base';
   amount: number;
   until: Until;
+  /** Global turn number through which this lasts (unset = ends with the current turn). */
+  exp?: number;
 }
 export interface FlagInst {
   flag: Flag;
   until: Until;
+  exp?: number;
+}
+
+/** A rule that applies to a player for a while ("you cannot play Character cards during this turn"). */
+export interface PlayerRule {
+  kind: 'noPlayChar' | 'endUntapDon' | 'endTrash' | 'noLifeToHand' | 'endActive' | 'endGainLife';
+  /** noPlayChar: minimum base cost that is forbidden (0 = all). endUntapDon: how many. endTrash: uid. */
+  n: number;
+  exp: number;
+}
+
+/** Things that happen in a game which cards can react to ("When ...,"). */
+export type EventType =
+  | 'donReturned'
+  | 'ko'
+  | 'removed'
+  | 'playChar'
+  | 'useEvent'
+  | 'useBlocker'
+  | 'lifeLost'
+  | 'lifeToHand'
+  | 'damage'
+  | 'rested'
+  | 'donGiven'
+  | 'trigger'
+  | 'drawFx'
+  | 'handTrashed'
+  | 'attack';
+
+export interface GameEvent {
+  type: EventType;
+  /** The player the event is about (the card's owner, or whoever did the thing). */
+  player: PlayerId;
+  /** Main card involved (0 when there is none). */
+  uid: number;
+  n: number;
+  /** The player whose action or effect caused it. */
+  by: PlayerId;
+  /** Detail: 'battle' | 'effect' for K.O.s, the removal mode, the zone a card was played from... */
+  how: string;
+  /** A second card: the attacker that won the battle, the attack target... */
+  other: number;
 }
 
 /** A card that is on the field (Leader, Character or Stage). */
@@ -72,6 +126,7 @@ export interface PlayerState {
   turns: number;
   /** "None of your Characters can be K.O.'d during this turn." */
   noKO: boolean;
+  rules?: PlayerRule[];
 }
 
 export type Intent =
@@ -91,7 +146,10 @@ export type Intent =
   | 'play'
   | 'overflow'
   | 'toLife'
-  | 'deckOrder';
+  | 'deckOrder'
+  /** Giving up one of your own cards (as a cost, or because an effect says so). */
+  | 'sacrifice'
+  | 'order';
 
 export type Choice =
   | { kind: 'mulligan'; player: PlayerId }
@@ -137,6 +195,8 @@ export interface Ctx {
   /** uid of the card whose effect this is (0 for system frames). */
   src: number;
   cardId: string;
+  /** The cards the effect's last choice picked ("that Character", "it"). */
+  those?: number[];
   /** Last 'select' answer. */
   sel: number[];
   /** Last 'confirm' / 'trigger' answer. */
@@ -172,6 +232,14 @@ export interface CostSpec {
   revealFilter?: (d: CardDef) => boolean;
   /** Add 1 card from the top or bottom of your Life to your hand. */
   lifeToHand?: boolean;
+  /** Any other cost, compiled from card text ("rest 2 of your Characters", "trash this Character"...). */
+  extra?: CostPart[];
+}
+
+export interface CostPart {
+  text: string;
+  can: (g: Game, c: Ctx) => boolean;
+  steps: Step[];
 }
 
 export interface EffectDef {
@@ -192,13 +260,28 @@ export interface EffectDef {
   tags?: string[];
   /** AI desirability: > 0 means "use it". Undefined = always use. */
   ai?: (g: Game, c: Ctx) => number;
+  /** timing 'event': which game event this reacts to, and whether a given occurrence counts. */
+  event?: EventType;
+  match?: (g: Game, self: FieldCard, ev: GameEvent) => boolean;
   steps: Step[];
+}
+
+/** Why a card is about to leave the field. */
+export interface RemovalCause {
+  mode: 'ko' | 'hand' | 'bottom' | 'top' | 'trash' | 'life' | 'lifeBottom';
+  battle: boolean;
+  /** Caused by the opponent (their attack or their effect). */
+  byOpp: boolean;
 }
 
 export interface ReplaceDef {
   text: string;
-  can: (g: Game, self: FieldCard, victim: FieldCard) => boolean;
-  apply: (g: Game, self: FieldCard) => void;
+  can: (g: Game, self: FieldCard, victim: FieldCard, cause: RemovalCause) => boolean;
+  /** Hand-written replacements: applied at once. They only cover removal by an opponent's effect. */
+  apply?: (g: Game, self: FieldCard) => void;
+  /** Compiled replacements: what you do "instead", run as its own effect (may ask for choices). */
+  steps?: Step[];
+  opt?: boolean;
 }
 
 export interface CardDef {
@@ -223,8 +306,18 @@ export interface CardDef {
   powerAura?: (g: Game, self: FieldCard, target: FieldCard) => number;
   /** Conditional keywords, e.g. "[DON!! x2] This Character gains [Rush]". */
   dynKeyword?: (g: Game, self: FieldCard, kw: Keyword) => boolean;
-  /** Continuous change to this card's own cost while it is on the field. */
-  costAura?: (g: Game, self: FieldCard) => number;
+  /** Continuous cost change this card gives to `target` (may be itself). */
+  costAura?: (g: Game, self: FieldCard, target: FieldCard) => number;
+  /** "Give this card in your hand -1 cost" — change to its own cost while it is in `pid`'s hand. */
+  handCost?: (g: Game, pid: PlayerId) => number;
+  /** Cost change this card (on the field) gives to cards in its owner's hand. */
+  handAura?: (g: Game, self: FieldCard, uid: number) => number;
+  /** Continuous keywords / states this card gives to `target` ("all of your {X} type Characters gain [Blocker]"). */
+  flagAura?: (g: Game, self: FieldCard, target: FieldCard, flag: Flag) => boolean;
+  /** True when one of the auras above also reaches the opponent's cards. */
+  auraFoe?: boolean;
+  /** "If ... would be K.O.'d / removed, you may ... instead." (compiled from text) */
+  replaces?: ReplaceDef[];
   cantBeKoByEffect?: boolean;
   /** "This Leader/Character cannot attack." */
   cantAttack?: boolean;
@@ -248,6 +341,10 @@ export interface Battle {
   noBlock: boolean;
   /** Defender cannot activate [Blocker] with this much power or more (0 = no limit). */
   noBlockMin: number;
+  /** Defender cannot activate [Blocker] with this much power or less. */
+  noBlockMax?: number;
+  /** [Blocker] Characters with this cost or less cannot block. */
+  noBlockCostMax?: number;
   blocked: boolean;
   /** Total counter power the defender has added this battle. */
   counterAdded: number;

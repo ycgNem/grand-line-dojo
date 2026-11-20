@@ -5,6 +5,7 @@ import { ALL_CARDS } from '../data/db';
 import type { CardDef } from '../engine/types';
 import { openCard } from './carddetail';
 import { type Child, btn, cardEl, clear, h } from './dom';
+import { localPictureCount } from './localart';
 
 export interface FilterState {
   q: string;
@@ -125,7 +126,7 @@ export function cardBrowser(o: BrowserOpts): Browser {
     sel('counter', 'Counter', [['', 'Any'], ['2000', '+2000'], ['1000', '+1000'], ['0', 'None']]),
     sel('feature', 'Feature', [['', 'Any'], ...FEATURES.map(([v, l]) => [v, l] as [string, string])]),
     sel('set', 'Set', [['', 'Any'], ...SETS.map((s) => [s, s] as [string, string])]),
-    sel('sim', 'Simulator', [['', 'Any'], ['play', 'Playable here'], ['ref', 'Reference only']]),
+    sel('sim', 'Simulator', [['', 'Any'], ['play', 'Playable here'], ['ref', 'Not playable yet']]),
     sel('sort', 'Sort', [['id', 'Card number'], ['name', 'Name'], ['cost', 'Cost ↑'], ['costd', 'Cost ↓'], ['power', 'Power ↓']]),
     btn('Reset', () => {
       Object.assign(f, newFilter(), o.lockCategory ? { category: f.category } : {});
@@ -195,8 +196,9 @@ export function render(root: HTMLElement, arg = ''): void {
         'div',
         { class: 'key' },
         h('b', null, `${playable.toLocaleString()} cards (${Math.round((playable / ALL_CARDS.length) * 100)}%) can be played in matches here. `),
-        `${by('scripted')} are hand-scripted and tested, ${by('auto')} were read automatically from their text, and ${by('vanilla')} have no effect text. The other ${by('none').toLocaleString()} are reference-only (dimmed, marked "REF"): readable and usable in Deck Lab lists, but their effects are too complex for the simulator to run. `,
+        `${by('scripted')} are hand-scripted and tested, ${by('auto').toLocaleString()} were read automatically from their printed text, and ${by('vanilla')} have no effect text. The other ${by('none').toLocaleString()} (dimmed, marked "REF") use one-off mechanics the simulator does not model yet: you can still read them and use them in Deck Lab lists. `,
         'The pictures are this site’s own drawings, one scene per colour — open a card to follow a link to its printed artwork.',
+        localPictureCount ? ` ${localPictureCount === 1 ? '1 card shows your own picture' : `${localPictureCount.toLocaleString()} cards show your own pictures`} from the local-art folder (on this computer only).` : null,
       ),
       browser.el,
     ),

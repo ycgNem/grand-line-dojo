@@ -13,6 +13,7 @@ import {
   isLeader,
   opp,
   ownerOf,
+  playCost,
   powerOf,
   unitsOf,
   whoActs,
@@ -35,7 +36,7 @@ export function describeAction(g: Game, a: Action): string {
   const nm = (u: number): string => defOf(g, u).name;
   switch (a.type) {
     case 'play':
-      return `Play ${nm(a.uid)} (${defOf(g, a.uid).cost} DON!!)`;
+      return `Play ${nm(a.uid)} (${playCost(g, ownerOf(a.uid), a.uid)} DON!!)`;
     case 'don':
       return `Give ${a.n} DON!! to ${nm(a.target)}`;
     case 'attack':
@@ -117,7 +118,10 @@ export function endTurnWarnings(g: Game, me: PlayerId): string[] {
   if (playable.length) out.push(`You can still play: ${playable.map((u) => defOf(g, u).name).join(', ')}.`);
   // On your first turn nothing can attack, so spare DON!! only matters if a card could still be played.
   if (p.donActive > 0 && (p.turns > 1 || playable.length)) {
-    const held = p.hand.map((u) => defOf(g, u)).filter((d) => d.category === 'Event' && d.cost <= p.donActive && d.effects?.some((e) => e.timing === 'counter'));
+    const held = p.hand
+      .filter((u) => playCost(g, ownerOf(u), u) <= p.donActive)
+      .map((u) => defOf(g, u))
+      .filter((d) => d.category === 'Event' && d.effects?.some((e) => e.timing === 'counter'));
     const keep = held.length
       ? ` The one good reason to hold DON!! back: paying for a [Counter] Event on the CPU's turn (you hold ${[...new Set(held.map((d) => d.name))].join(', ')}). If that is the plan, end the turn.`
       : '';
